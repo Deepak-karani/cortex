@@ -71,6 +71,58 @@ export interface MemoryRecord {
   hrvRecovered: boolean;
   recoveryTimeSeconds: number;
   socraticQuestion?: string;
+  userId?: string;
+  drivers?: string[];
+}
+
+export interface AppStressEntry {
+  app: string;
+  visits: number;
+  averageLoadOnArrival: number;
+  averageLoadDelta5min: number;
+  redEpisodesTriggered: number;
+  lastContextHints: string[];
+  signal: 'safe' | 'mild' | 'risky';
+}
+
+export interface UserProfile {
+  userId: string;
+  episodeCount: number;
+  topTriggers: { trigger: string; count: number }[];
+  interventionStats: {
+    intervention: string;
+    tried: number;
+    recovered: number;
+    successRate: number;
+  }[];
+  bestIntervention: string | null;
+  averageRecoverySeconds: number | null;
+  dominantPattern: string | null;
+  lastEpisodeAt: number | null;
+  appStress: AppStressEntry[];
+  riskyApps: string[];
+}
+
+export type PolicyRiskClass = 'observe' | 'soft_action' | 'hard_action';
+export type PolicyDecision = 'allow' | 'block' | 'redact';
+
+export interface PolicyAuditEntry {
+  id: string;
+  timestamp: number;
+  toolName: string;
+  riskClass: PolicyRiskClass;
+  decision: PolicyDecision;
+  reason: string;
+  cognitiveState: CognitiveState;
+  cognitiveLoadScore: number;
+}
+
+export interface PolicyAuditSummary {
+  total: number;
+  allowed: number;
+  blocked: number;
+  redacted: number;
+  byRiskClass: Record<PolicyRiskClass, number>;
 }
 
 export type DemoSpeed = 1 | 2 | 4;

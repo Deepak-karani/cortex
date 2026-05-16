@@ -16,7 +16,7 @@
  * we do not silently mask the failure.
  */
 
-import { getFallbackStatus } from './nemotronAgent';
+import { getFallbackStatus, probeOracleHealth } from './nemotronAgent';
 
 export interface RuntimeHealth {
   ok: boolean;
@@ -57,6 +57,11 @@ function cfg() {
  * timeout and surfaces what comes back.
  */
 export async function probeRuntime(): Promise<RuntimeHealth> {
+  // Probe the Oracle backend's /health in parallel with the OpenAI-compatible
+  // /models probe. The dashboard's fallback pill reads from the Oracle status
+  // (that's the LLM path users actually see), but we still measure /models
+  // for the DGX status card's "served model + latency".
+  void probeOracleHealth();
   const { baseUrl, configuredModel, apiKey } = cfg();
   const url = `${baseUrl.replace(/\/$/, '')}/models`;
   const notes: string[] = [];

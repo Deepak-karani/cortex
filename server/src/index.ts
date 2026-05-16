@@ -14,10 +14,24 @@ import { scoreCognitiveLoad } from '../sim/cognitiveModel';
 import { Orchestrator } from '../agents/orchestrator';
 import {
   clearMemories,
+  defaultUserId,
   loadMemories,
   makeMemoryId,
   saveMemory,
 } from '../memory/memoryStore';
+import { getUserProfile } from '../memory/userProfile';
+import {
+  clearAppContext,
+  getAppStressStats,
+  recordAppContext,
+} from '../memory/appContextTracker';
+import {
+  getAuditLog,
+  getAuditSummary,
+  rehearsePolicy,
+  subscribeAudit,
+} from '../tools/policy';
+import { TOOL_NAMES } from '../tools/cortexTools';
 import { getFallbackStatus } from '../agents/nemotronAgent';
 import { getRuntimeHealth, probeRuntime, startRuntimeHealthLoop } from '../agents/openclawRuntime';
 import {
@@ -153,7 +167,13 @@ function sanitizeScreen(input: unknown): ScreenSummary | null {
     ? s.ocrTokens
         .filter((t): t is string => typeof t === 'string')
         .map((t) => t.trim().toLowerCase())
-        .filter((t) => t.length >= 2 && t.length <= 24)
+        // Defense in depth — the client tokenizer is the primary filter, but
+        // catch anything that slips through (pure numbers, single chars, junk
+        // glyphs). Tokens must be ≥3 chars, contain letters, and not be
+        // mostly digits.
+        .filter((t) => t.length >= 3 && t.length <= 24)
+        .filter((t) => /[a-z]/.test(t))
+        .filter((t) => !/^[\d.]+$/.test(t))
         .slice(0, 24)
     : [];
   return {
@@ -205,10 +225,22 @@ orchestrator.on('insight', (insight: ProductivityInsight) => {
   io.emit('insight:new', insight);
 });
 
+// Stream every policy/sandbox decision so the UI can render the audit log
+// live. Judges *see* the sandbox catch aggressive tool calls in real time —
+// the architectural piece that NemoClaw owns in NVIDIA's stack.
+subscribeAudit((entry) => {
+  io.emit('policy:audit', entry);
+});
+
 // DGX compute telemetry — emit every 2s so the HUD pulse is always alive.
 setInterval(() => {
   io.emit('compute:update', orchestrator.getComputeTelemetry());
   io.emit('runtime:update', getRuntimeHealth());
+  // Also rebroadcast the latest fallback status — the runtime health loop
+  // updates it on a 15s cadence even when the sim isn't running, so this is
+  // how a freshly-loaded dashboard sees "Oracle live" without waiting for
+  // the first agent run.
+  io.emit('fallback:update', getFallbackStatus());
 }, 2000);
 
 // Sim → cognitive scoring → broadcast.
@@ -239,6 +271,18 @@ sim.on('telemetry', async (rawTelemetry: Telemetry) => {
     const recoveryTimeSeconds = episodeStartTime
       ? Math.round((Date.now() - episodeStartTime) / 1000)
       : 0;
+    // Capture which drivers were dominant in this episode so the per-user
+    // profile can aggregate triggers later. Done before save so the profile
+    // refresh sees the new record.
+    const drivers: string[] = [];
+    if (telemetry.hrv < 35) drivers.push('HRV drop');
+    if (telemetry.heartRate > 90) drivers.push('Heart rate spike');
+    if (telemetry.contextSwitches > 12) drivers.push('Context switching');
+    if (telemetry.unreadNotifications > 15) drivers.push('Notification overload');
+    if (telemetry.deadlineMinutes < 15) drivers.push('Deadline pressure');
+    if (telemetry.errorRate > 0.08) drivers.push('Error churn');
+
+    const userId = defaultUserId();
     const record: MemoryRecord = {
       id: makeMemoryId(),
       timestamp: Date.now(),
@@ -246,13 +290,24 @@ sim.on('telemetry', async (rawTelemetry: Telemetry) => {
       patternSummary: `${lastNonGreenState} episode: HRV bottomed near ${telemetry.hrv}ms, HR peaked, notifications spiked.`,
       interventions: [...new Set(episodeInterventions)],
       outcome: 'Recovered to Green.',
-      hrvRecovered: telemetry.hrv > 50,
+      // "Recovered" here means the episode resolved cleanly back to Green
+      // (which is the only branch reaching this code). The HRV cutoff was
+      // previously too aggressive (>50) and suppressed the personalization
+      // profile's success-rate math for episodes that landed at HRV 40-49.
+      // A softer floor matches the cognitive model's Green threshold.
+      hrvRecovered: telemetry.hrv >= 40,
       recoveryTimeSeconds,
+      userId,
+      drivers,
     };
     try {
       await saveMemory(record);
-      const all = await loadMemories();
+      const all = await loadMemories(userId);
       io.emit('memory:update', all);
+      // Profile shifts every time a new episode lands — push the fresh
+      // aggregate so the dashboard's personalization pill stays accurate.
+      const profile = await getUserProfile(userId);
+      io.emit('profile:update', profile);
     } catch (err) {
       console.error('Failed to persist memory record', err);
     }
@@ -479,15 +534,43 @@ app.get('/api/runtime', async (req, res) => {
   res.json({ ok: true, runtime: getRuntimeHealth() });
 });
 
-app.get('/memory', async (_req, res) => {
-  const memories = await loadMemories();
-  res.json({ memories });
+app.get('/memory', async (req, res) => {
+  const userId = (req.query.userId as string | undefined) ?? defaultUserId();
+  const memories = await loadMemories(userId);
+  res.json({ memories, userId });
 });
 
-app.post('/memory/clear', async (_req, res) => {
-  await clearMemories();
+app.post('/memory/clear', async (req, res) => {
+  const userId = (req.query.userId as string | undefined) ?? defaultUserId();
+  await clearMemories(userId);
+  await clearAppContext(userId);
   io.emit('memory:update', []);
-  res.json({ ok: true });
+  io.emit('profile:update', await getUserProfile(userId));
+  res.json({ ok: true, userId });
+});
+
+// Per-user profile derived from memory. Pure projection — recompute on each
+// request so it always reflects the latest persisted state. Cheap enough
+// (in-memory aggregation over ≤50 records) that caching isn't worth it.
+app.get('/api/profile', async (req, res) => {
+  const userId = (req.query.userId as string | undefined) ?? defaultUserId();
+  const profile = await getUserProfile(userId);
+  res.json({ ok: true, profile });
+});
+
+// Policy / sandbox audit log. Every tool invocation passes through the
+// policy gate; this surface lets the dashboard render decisions live and
+// lets demo viewers inspect the trail after the fact. The summary is
+// useful for an at-a-glance "% blocked / % allowed" pitch number.
+app.get('/api/policy/audit', (_req, res) => {
+  res.json({ ok: true, audit: getAuditLog(), summary: getAuditSummary() });
+});
+
+// Force a full (tool × state) sweep so the audit panel shows the policy's
+// complete decision matrix on demand. Useful at boot or as a demo hook.
+app.post('/api/policy/rehearse', (_req, res) => {
+  const entries = rehearsePolicy(TOOL_NAMES);
+  res.json({ ok: true, count: entries.length, summary: getAuditSummary() });
 });
 
 app.post('/demo/start', (_req, res) => {
@@ -531,12 +614,37 @@ app.post('/demo/manual-state', (req, res) => {
 // Browser-side pipeline can use the socket OR this POST. Either way, only
 // summarized metrics are accepted. Raw frames are never received here.
 // Screen Understanding REST endpoint.
+/**
+ * Record this screen observation into the per-user app-context tracker so
+ * the personalization layer can learn which apps tend to escalate this
+ * specific user's cognitive load. Cheap (in-memory + async persist) so it's
+ * safe to fire on every tick.
+ */
+function recordScreenForCorrelation(s: ScreenSummary): void {
+  const score = lastAssessment?.cognitiveLoadScore ?? 0;
+  const state = lastAssessment?.state ?? 'Green';
+  // contextHint: prefer first window title, fall back to activeTitle dash-split
+  const contextHint =
+    s.windows?.[0]?.title?.trim() ||
+    s.activeTitle.split(/\s+[—\-|·]\s+/)[0]?.trim() ||
+    null;
+  void recordAppContext({
+    userId: defaultUserId(),
+    timestamp: s.timestamp,
+    app: s.activeApp,
+    contextHint: contextHint && contextHint.length > 0 ? contextHint.slice(0, 60) : null,
+    cognitiveState: state,
+    cognitiveLoadScore: score,
+  });
+}
+
 app.post('/api/screen-state', (req, res) => {
   const sanitized = sanitizeScreen(req.body);
   if (!sanitized) {
     return res.status(400).json({ ok: false, error: 'invalid screen payload' });
   }
   setLatestScreen(sanitized);
+  recordScreenForCorrelation(sanitized);
   io.emit('screen:update', sanitized);
   return res.json({ ok: true, screen: sanitized });
 });
@@ -610,7 +718,10 @@ io.on('connection', async (socket) => {
   if (lastTelemetry) socket.emit('telemetry:update', lastTelemetry);
   if (lastAssessment) socket.emit('cognitive:update', lastAssessment);
   socket.emit('fallback:update', getFallbackStatus());
-  socket.emit('memory:update', await loadMemories());
+  const bootstrapUserId = defaultUserId();
+  socket.emit('memory:update', await loadMemories(bootstrapUserId));
+  socket.emit('profile:update', await getUserProfile(bootstrapUserId));
+  socket.emit('policy:bootstrap', { audit: getAuditLog(), summary: getAuditSummary() });
   const attentionSnapshot = getLatestAttention();
   if (attentionSnapshot) socket.emit('attention:update', attentionSnapshot);
   const screenSnapshot = getLatestScreen();
@@ -637,6 +748,7 @@ io.on('connection', async (socket) => {
     const sanitized = sanitizeScreen(summary);
     if (!sanitized) return;
     setLatestScreen(sanitized);
+    recordScreenForCorrelation(sanitized);
     socket.broadcast.emit('screen:update', sanitized);
   });
   socket.on('screen:start', () => {
@@ -669,8 +781,13 @@ io.on('connection', async (socket) => {
 
 const PORT_TO_USE = PORT;
 startRuntimeHealthLoop(15_000);
+// Pre-populate the policy audit log with a full decision matrix so the
+// sandbox panel has real data to render the moment the dashboard loads.
+// Every entry is a real policy evaluation — no synthetic decisions.
+rehearsePolicy(TOOL_NAMES);
 server.listen(PORT_TO_USE, () => {
   console.log(`Cortex Arena server running on http://localhost:${PORT_TO_USE}`);
   console.log(`Allowed client origin: ${CLIENT_ORIGIN}`);
   console.log(`Nemotron endpoint: ${process.env.NEMOTRON_BASE_URL ?? 'http://localhost:8000/v1'}`);
+  console.log(`Policy audit primed with ${getAuditSummary().total} decisions.`);
 });

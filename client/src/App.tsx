@@ -15,6 +15,8 @@ import { ReasoningSummary } from './components/dashboard/ReasoningSummary';
 import { TimelinePanel } from './components/dashboard/TimelinePanel';
 import { PrivacyPanel } from './components/dashboard/PrivacyPanel';
 import { OnboardingBar } from './components/dashboard/OnboardingBar';
+import { PolicySandboxPanel } from './components/dashboard/PolicySandboxPanel';
+import { PersonalizationCallout } from './components/dashboard/PersonalizationCallout';
 import type { AttentionMetrics, ScreenSummary } from './types';
 
 export default function App() {
@@ -148,6 +150,12 @@ export default function App() {
             <TimelinePanel />
           </div>
           <div className="lg:col-span-1">
+            <PolicySandboxPanel />
+          </div>
+        </div>
+
+        <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
+          <div className="lg:col-span-3">
             <PrivacyPanel
               webcamEnabled={attention.status === 'running'}
               screenEnabled={screen.status.kind === 'running'}
@@ -157,6 +165,7 @@ export default function App() {
           </div>
         </div>
       </div>
+      <PersonalizationCallout />
     </DashboardShell>
   );
 }

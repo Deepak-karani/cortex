@@ -17,7 +17,8 @@ import {
   simulateFutureTimelines,
 } from './nemotronAgent';
 import { runTool, type ToolName } from '../tools/cortexTools';
-import { loadMemories, recallSimilarMemory } from '../memory/memoryStore';
+import { defaultUserId, loadMemories, recallSimilarMemory } from '../memory/memoryStore';
+import { getUserProfile } from '../memory/userProfile';
 import { simulateFutures } from '../sim/futureSimulator';
 import { getLatestAttention } from '../tools/checkAttentionState';
 
@@ -212,10 +213,12 @@ export class ReactAgent extends EventEmitter {
 
     // 7) Generate Socratic question if planned.
     if (decision.data.tools.includes('ask_socratic')) {
+      const profile = await getUserProfile(defaultUserId());
       const socResult = await generateSocraticQuestion({
         telemetry: input.telemetry,
         assessment: input.assessment,
         attention: probedAttention,
+        profile,
       });
       lastFallback = socResult.fallback;
       socratic = socResult.data;

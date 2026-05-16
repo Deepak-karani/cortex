@@ -9,6 +9,44 @@ const STOPWORDS = new Set([
   'new', 'old', 'see', 'use', 'get', 'set', 'app', 'tab',
 ]);
 
+// UI chrome / OCR noise. Tesseract reliably hallucinates these from menu
+// bars, icons, dotted borders, and small unicode glyphs. Dropping them keeps
+// the Current Task panel readable.
+const UI_NOISE = new Set([
+  'file', 'edit', 'view', 'go', 'help', 'window', 'tools', 'run', 'debug',
+  'terminal', 'menu', 'home', 'back', 'forward', 'reload', 'refresh',
+  'close', 'minimize', 'maximize', 'search', 'settings', 'preferences',
+  'cancel', 'ok', 'okay', 'yes', 'no', 'done', 'save', 'open',
+  'untitled', 'document', 'page', 'pages', 'tab', 'tabs', 'item', 'items',
+  'lll', 'iii', 'ooo', 'xxx', 'aaa', 'nnn', 'mmm',
+  'am', 'pm', 'mon', 'tue', 'wed', 'thu', 'fri', 'sat', 'sun',
+  'jan', 'feb', 'mar', 'apr', 'may', 'jun', 'jul', 'aug', 'sep', 'oct', 'nov', 'dec',
+]);
+
+// A token is "wordlike" if it looks like a real word a human wrote, not OCR
+// confetti. We allow letters, digits, dots, slashes, hyphens, underscores;
+// reject anything else, anything mostly-digits, or anything with too few
+// vowels (Tesseract's classic "consonant soup" failure mode).
+function isWordlike(t: string): boolean {
+  if (!/^[a-z0-9._/\-]+$/.test(t)) return false;
+  if (/^[\d.]+$/.test(t)) return false; // pure numbers / versions
+  if (/^[0-9]/.test(t) && !/[a-z]/.test(t)) return false; // starts numeric, no letters
+  const letters = t.replace(/[^a-z]/g, '');
+  if (letters.length < 3) return false; // need at least 3 letters
+  // Vowel check — but spare known programming tokens (e.g. "fn", "rx") via
+  // the length floor above. Allow tokens with letters that contain at least
+  // one vowel OR look like a known code construct (.ts / src/ etc).
+  const hasVowel = /[aeiouy]/.test(letters);
+  const looksCode = /[._/]/.test(t);
+  if (!hasVowel && !looksCode) return false;
+  // Reject anything where one letter repeats > 60% (e.g. "llllo", "aaabb").
+  const counts: Record<string, number> = {};
+  for (const ch of letters) counts[ch] = (counts[ch] ?? 0) + 1;
+  const maxRepeat = Math.max(...Object.values(counts));
+  if (maxRepeat / letters.length > 0.6) return false;
+  return true;
+}
+
 const APP_HINTS: Record<string, RegExp> = {
   'VS Code': /\b(vscode|visual\s*studio\s*code|cortex_2|src\/|\.ts|\.tsx|tsx|tsconfig)\b/i,
   'Chrome': /\b(http|https|google\.com|stackoverflow|github\.com|search|chrome)\b/i,
@@ -46,10 +84,11 @@ export function tokenizeOcr(rawText: string): TokenizeOutput {
   const seen = new Set<string>();
   const tokens: string[] = [];
   for (const piece of clean.split(/\s+/)) {
-    const t = piece.toLowerCase().trim();
+    const t = piece.toLowerCase().trim().replace(/^[.\-_/]+|[.\-_/]+$/g, '');
     if (t.length < 3 || t.length > 24) continue;
     if (STOPWORDS.has(t)) continue;
-    if (/^[\d.]+$/.test(t)) continue; // pure numbers
+    if (UI_NOISE.has(t)) continue;
+    if (!isWordlike(t)) continue;
     if (seen.has(t)) continue;
     seen.add(t);
     tokens.push(t);

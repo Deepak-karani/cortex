@@ -16,6 +16,7 @@ import {
 } from 'lucide-react';
 import { useCortexStore } from '../../store/useCortexStore';
 import type { TaskType } from '../../types';
+import { PersonalizationPill } from './PersonalizationPill';
 
 const TASK_META: Record<
   TaskType,
@@ -97,6 +98,8 @@ export function CurrentTaskCard() {
       {analysis?.summary && (
         <div className="text-sm text-cortex-ink/80 leading-snug">{analysis.summary}</div>
       )}
+
+      <PersonalizationPill />
 
       {screen.blocker && (
         <div className="rounded-lg border border-cortex-orange/40 bg-cortex-orange/10 p-3 flex items-start gap-2">

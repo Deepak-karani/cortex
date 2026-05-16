@@ -1,5 +1,6 @@
 import { useMemo } from 'react';
 import type { CognitiveAssessment, MemoryRecord } from '../types';
+import { PersonalizationPill } from './dashboard/PersonalizationPill';
 
 interface Props {
   memory: MemoryRecord[];
@@ -22,6 +23,7 @@ export default function MemoryReplayPanel({ memory, assessment, onClear }: Props
       <div className="panel-header">
         <span>persistent memory · /server/data/memory.json</span>
         <div className="flex items-center gap-2">
+          <PersonalizationPill compact />
           <span className="text-cortex-accent">{sorted.length} episodes</span>
           <button
             className="text-cortex-dim hover:text-cortex-red text-[10px] uppercase tracking-widest font-mono"

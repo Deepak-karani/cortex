@@ -16,6 +16,9 @@ import type {
   SocraticPrompt,
   Telemetry,
   ToolResult,
+  UserProfile,
+  PolicyAuditEntry,
+  PolicyAuditSummary,
 } from '../types';
 import { SERVER_URL } from '../lib/constants';
 import { getHeartRateSource, type HeartRateTrend } from '../lib/biometrics/heartRateSource';
@@ -125,6 +128,11 @@ export interface CortexStore {
     socratic: SocraticPrompt | null;
   };
   memory: MemoryRecord[];
+  profile: UserProfile | null;
+  policy: {
+    audit: PolicyAuditEntry[];
+    summary: PolicyAuditSummary;
+  };
   telemetry: Telemetry | null;
   timeline: TimelineEvent[];
 
@@ -263,6 +271,11 @@ export const useCortexStore = create<CortexStore>((set, get) => ({
     socratic: null,
   },
   memory: [],
+  profile: null,
+  policy: {
+    audit: [],
+    summary: { total: 0, allowed: 0, blocked: 0, redacted: 0, byRiskClass: { observe: 0, soft_action: 0, hard_action: 0 } },
+  },
   telemetry: null,
   timeline: [],
   demoMode: false,
@@ -621,6 +634,25 @@ export const useCortexStore = create<CortexStore>((set, get) => ({
       set((state) => ({ agent: { ...state.agent, socratic: p } })),
     );
     s.on('memory:update', (mem: MemoryRecord[]) => set({ memory: mem }));
+    s.on('profile:update', (p: UserProfile) => set({ profile: p }));
+    s.on('policy:bootstrap', (payload: { audit: PolicyAuditEntry[]; summary: PolicyAuditSummary }) => {
+      set({ policy: { audit: payload.audit.slice(-80), summary: payload.summary } });
+    });
+    s.on('policy:audit', (entry: PolicyAuditEntry) => {
+      set((state) => {
+        const audit = [...state.policy.audit, entry].slice(-80);
+        const summary = { ...state.policy.summary };
+        summary.total += 1;
+        if (entry.decision === 'allow') summary.allowed += 1;
+        if (entry.decision === 'block') summary.blocked += 1;
+        if (entry.decision === 'redact') summary.redacted += 1;
+        summary.byRiskClass = {
+          ...summary.byRiskClass,
+          [entry.riskClass]: (summary.byRiskClass[entry.riskClass] ?? 0) + 1,
+        };
+        return { policy: { audit, summary } };
+      });
+    });
     s.on('fallback:update', (f: FallbackStatus) =>
       set((state) => ({
         system: {

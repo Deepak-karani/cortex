@@ -21,7 +21,8 @@ import {
   simulateFutureTimelines,
 } from './nemotronAgent';
 import { runTool, type ToolName } from '../tools/cortexTools';
-import { recallSimilarMemory } from '../memory/memoryStore';
+import { defaultUserId, recallSimilarMemory } from '../memory/memoryStore';
+import { getUserProfile } from '../memory/userProfile';
 import { simulateFutures } from '../sim/futureSimulator';
 import { getLatestAttention } from '../tools/checkAttentionState';
 import { getLatestScreen } from '../sim/screenStore';
@@ -168,12 +169,17 @@ export class Orchestrator extends EventEmitter {
     });
     for (const ins of insights) this.emit('insight', ins);
 
-    // 2) Recall memory in parallel (cheap, deterministic).
-    const memory = await recallSimilarMemory({
-      state: input.assessment.state,
-      telemetry: input.telemetry,
-      cognitiveLoadScore: input.assessment.cognitiveLoadScore,
-    });
+    // 2) Recall memory + load profile in parallel (cheap, deterministic).
+    const userId = defaultUserId();
+    const [memory, profile] = await Promise.all([
+      recallSimilarMemory({
+        state: input.assessment.state,
+        telemetry: input.telemetry,
+        cognitiveLoadScore: input.assessment.cognitiveLoadScore,
+        userId,
+      }),
+      getUserProfile(userId),
+    ]);
 
     push(
       trace(
@@ -297,6 +303,7 @@ export class Orchestrator extends EventEmitter {
         telemetry: input.telemetry,
         assessment: input.assessment,
         attention,
+        profile,
       });
       this.trackNemotron(Date.now() - socStart, socResult.fallback.active);
       lastFallback = socResult.fallback;

@@ -9,6 +9,11 @@ import { recallSimilarMemory } from '../memory/memoryStore';
 import { simulateFutures } from '../sim/futureSimulator';
 import { checkAttentionState } from './checkAttentionState';
 import { analyzeScreenContext } from './analyzeScreenContext';
+import {
+  buildPolicyDeniedResult,
+  evaluateToolCall,
+  recordAudit,
+} from './policy';
 
 export type ToolName =
   | 'recall_memory'
@@ -226,6 +231,15 @@ export async function runTool(
       expectedBenefit: 'N/A',
       timestamp: Date.now(),
     };
+  }
+
+  // Every tool invocation passes through the policy/sandbox gate before the
+  // runtime executes it. Blocked + redacted decisions short-circuit here —
+  // the tool function never runs and no external side effect occurs.
+  const verdict = evaluateToolCall(name, ctx.assessment);
+  recordAudit(name, verdict, ctx.assessment);
+  if (verdict.decision !== 'allow') {
+    return buildPolicyDeniedResult(name, verdict);
   }
   return fn(ctx);
 }

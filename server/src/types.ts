@@ -79,6 +79,45 @@ export interface MemoryRecord {
   hrvRecovered: boolean;
   recoveryTimeSeconds: number;
   socraticQuestion?: string;
+  /**
+   * Owner of the episode. Single-machine deployments default to `local`
+   * (override with CORTEX_USER_ID). Personalization derives per-user
+   * patterns and intervention success rates from these records.
+   */
+  userId?: string;
+  /** Snapshot of the dominant overload drivers, kept for profile aggregation. */
+  drivers?: string[];
+}
+
+/**
+ * Aggregated per-user profile derived from MemoryRecord history. Pure
+ * function of memory — nothing here is independently persisted.
+ */
+export interface AppStressEntry {
+  app: string;
+  visits: number;
+  averageLoadOnArrival: number;
+  averageLoadDelta5min: number;
+  redEpisodesTriggered: number;
+  lastContextHints: string[];
+  signal: 'safe' | 'mild' | 'risky';
+}
+
+export interface UserProfile {
+  userId: string;
+  episodeCount: number;
+  topTriggers: { trigger: string; count: number }[];
+  interventionStats: { intervention: string; tried: number; recovered: number; successRate: number }[];
+  bestIntervention: string | null;
+  averageRecoverySeconds: number | null;
+  dominantPattern: string | null;
+  lastEpisodeAt: number | null;
+  /**
+   * Per-app stress correlation. Populated by the screen-update pipeline as
+   * the user navigates between apps and their cognitive state shifts.
+   */
+  appStress: AppStressEntry[];
+  riskyApps: string[]; // shortcut: apps with signal === 'risky'
 }
 
 export type DemoSpeed = 1 | 2 | 4;
