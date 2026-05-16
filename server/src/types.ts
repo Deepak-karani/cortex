@@ -87,6 +87,13 @@ export interface MemoryRecord {
   userId?: string;
   /** Snapshot of the dominant overload drivers, kept for profile aggregation. */
   drivers?: string[];
+  /**
+   * If the episode happened while a calendar event was active (or within a
+   * short window after it ended), tag it with the event's canonical kind
+   * so the calendar correlator can find similar past episodes when a
+   * future event of the same kind approaches.
+   */
+  eventTag?: string;
 }
 
 /**

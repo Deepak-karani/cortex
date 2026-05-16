@@ -6,6 +6,8 @@ dist/
 *.tsbuildinfo
 .DS_Store
 server/data/memory.json
+server/data/app-context.json
+server/data/calendar.json
 .vite/
 client/dist/
 server/dist/

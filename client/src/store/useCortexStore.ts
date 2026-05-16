@@ -19,6 +19,8 @@ import type {
   UserProfile,
   PolicyAuditEntry,
   PolicyAuditSummary,
+  CalendarUpcoming,
+  CoachMessage,
 } from '../types';
 import { SERVER_URL } from '../lib/constants';
 import { getHeartRateSource, type HeartRateTrend } from '../lib/biometrics/heartRateSource';
@@ -132,6 +134,15 @@ export interface CortexStore {
   policy: {
     audit: PolicyAuditEntry[];
     summary: PolicyAuditSummary;
+  };
+  calendar: {
+    upcoming: CalendarUpcoming | null;
+    preempt: CalendarUpcoming | null;
+    preemptShownAt: number | null;
+  };
+  coach: {
+    latest: CoachMessage | null;
+    history: CoachMessage[];
   };
   telemetry: Telemetry | null;
   timeline: TimelineEvent[];
@@ -275,6 +286,15 @@ export const useCortexStore = create<CortexStore>((set, get) => ({
   policy: {
     audit: [],
     summary: { total: 0, allowed: 0, blocked: 0, redacted: 0, byRiskClass: { observe: 0, soft_action: 0, hard_action: 0 } },
+  },
+  calendar: {
+    upcoming: null,
+    preempt: null,
+    preemptShownAt: null,
+  },
+  coach: {
+    latest: null,
+    history: [],
   },
   telemetry: null,
   timeline: [],
@@ -637,6 +657,26 @@ export const useCortexStore = create<CortexStore>((set, get) => ({
     s.on('profile:update', (p: UserProfile) => set({ profile: p }));
     s.on('policy:bootstrap', (payload: { audit: PolicyAuditEntry[]; summary: PolicyAuditSummary }) => {
       set({ policy: { audit: payload.audit.slice(-80), summary: payload.summary } });
+    });
+    s.on('coach:message', (msg: CoachMessage | null) => {
+      if (!msg) {
+        set({ coach: { latest: null, history: [] } });
+        return;
+      }
+      set((state) => ({
+        coach: {
+          latest: msg,
+          history: [...state.coach.history, msg].slice(-12),
+        },
+      }));
+    });
+    s.on('calendar:upcoming', (payload: CalendarUpcoming) => {
+      set((state) => ({ calendar: { ...state.calendar, upcoming: payload } }));
+    });
+    s.on('calendar:preempt', (payload: CalendarUpcoming) => {
+      set((state) => ({
+        calendar: { ...state.calendar, preempt: payload, preemptShownAt: Date.now() },
+      }));
     });
     s.on('policy:audit', (entry: PolicyAuditEntry) => {
       set((state) => {

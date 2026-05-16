@@ -23,6 +23,7 @@ import {
 import { runTool, type ToolName } from '../tools/cortexTools';
 import { defaultUserId, recallSimilarMemory } from '../memory/memoryStore';
 import { getUserProfile } from '../memory/userProfile';
+import { correlateUpcomingEvent } from '../calendar/eventCorrelator';
 import { simulateFutures } from '../sim/futureSimulator';
 import { getLatestAttention } from '../tools/checkAttentionState';
 import { getLatestScreen } from '../sim/screenStore';
@@ -169,9 +170,11 @@ export class Orchestrator extends EventEmitter {
     });
     for (const ins of insights) this.emit('insight', ins);
 
-    // 2) Recall memory + load profile in parallel (cheap, deterministic).
+    // 2) Recall memory + load profile + upcoming-event correlation in
+    //    parallel. All three are cheap, deterministic, and feed the
+    //    Nemotron grounding sidecar later.
     const userId = defaultUserId();
-    const [memory, profile] = await Promise.all([
+    const [memory, profile, upcoming] = await Promise.all([
       recallSimilarMemory({
         state: input.assessment.state,
         telemetry: input.telemetry,
@@ -179,6 +182,7 @@ export class Orchestrator extends EventEmitter {
         userId,
       }),
       getUserProfile(userId),
+      correlateUpcomingEvent(userId),
     ]);
 
     push(
@@ -299,11 +303,23 @@ export class Orchestrator extends EventEmitter {
     // 8) Socratic if planned.
     if (decision.data.tools.includes('ask_socratic')) {
       const socStart = Date.now();
+      const upcomingHint =
+        upcoming.event && upcoming.correlation.signal !== 'unknown'
+          ? {
+              title: upcoming.event.title,
+              tag: upcoming.event.eventTag,
+              minutesUntil: Math.max(0, Math.round((upcoming.event.startsAt - Date.now()) / 60_000)),
+              historicalSignal: upcoming.correlation.signal,
+              historicalMatches: upcoming.correlation.matches,
+            }
+          : null;
       const socResult = await generateSocraticQuestion({
         telemetry: input.telemetry,
         assessment: input.assessment,
         attention,
         profile,
+        upcomingEvent: upcomingHint,
+        currentTaskHint: screen?.inferredTask ?? null,
       });
       this.trackNemotron(Date.now() - socStart, socResult.fallback.active);
       lastFallback = socResult.fallback;

@@ -73,6 +73,7 @@ export interface MemoryRecord {
   socraticQuestion?: string;
   userId?: string;
   drivers?: string[];
+  eventTag?: string;
 }
 
 export interface AppStressEntry {
@@ -101,6 +102,53 @@ export interface UserProfile {
   lastEpisodeAt: number | null;
   appStress: AppStressEntry[];
   riskyApps: string[];
+}
+
+export type EventTag =
+  | 'design_review'
+  | 'deep_work'
+  | '1_1'
+  | 'demo_prep'
+  | 'standup'
+  | 'lunch'
+  | 'focus_block'
+  | 'other';
+
+export interface CalendarEvent {
+  id: string;
+  userId: string;
+  title: string;
+  eventTag: EventTag;
+  startsAt: number;
+  endsAt: number;
+  attendees?: string[];
+  notes?: string;
+}
+
+export interface EventCorrelation {
+  eventTag: EventTag | null;
+  matches: number;
+  redCount: number;
+  yellowCount: number;
+  recoveredCount: number;
+  bestIntervention: string | null;
+  averageRecoverySeconds: number | null;
+  confidence: number;
+  signal: 'safe' | 'mild' | 'risky' | 'unknown';
+  recommendation: string;
+}
+
+export interface CalendarUpcoming {
+  event: CalendarEvent | null;
+  correlation: EventCorrelation;
+}
+
+export interface CoachMessage {
+  timestamp: number;
+  question: string;
+  rationale: string;
+  trigger: string;
+  cognitiveState: CognitiveState;
 }
 
 export type PolicyRiskClass = 'observe' | 'soft_action' | 'hard_action';

@@ -101,6 +101,15 @@ async function callOracleBackend(input: {
   assessment: CognitiveAssessment;
   attention?: AttentionMetrics | null;
   profile?: UserProfile | null;
+  upcomingEvent?: {
+    title: string;
+    tag: string;
+    minutesUntil: number;
+    historicalSignal: string;
+    historicalMatches: number;
+  } | null;
+  currentTaskHint?: string | null;
+  voice?: 'socratic' | 'coach';
 }): Promise<SocraticPrompt> {
   const baseUrl = process.env.ORACLE_BACKEND_URL!.trim();
   const hrvDrop = Math.max(0, Math.min(80, Math.round(80 - input.telemetry.hrv)));
@@ -109,18 +118,20 @@ async function callOracleBackend(input: {
     (input.telemetry.errorRate / 0.15) * 0.4;
   const compileFailures = Math.round(Math.max(0, Math.min(12, stressFactor * 12)));
   const repeatedFile =
-    input.assessment.cognitiveLoadScore > 50 ? input.telemetry.currentTask : '';
+    input.assessment.cognitiveLoadScore > 50
+      ? input.currentTaskHint ?? input.telemetry.currentTask
+      : '';
   const isFrustrated =
     input.assessment.state === 'Red' ||
     input.attention?.interpretedState === 'Fatigued' ||
     input.attention?.interpretedState === 'Distracted';
   const deletedComment = isFrustrated ? '// FIXME: why is this not working' : '';
 
-  // Personalization payload — optional sidecar the Oracle can use to
-  // ground the Socratic question in this specific user's history. The
-  // Oracle backend is a pass-through to Nemotron-3-Super and ignores
-  // unknown fields, so older deployments degrade to the generic path
-  // without breaking.
+  // Personalization sidecar — the richer this is, the more grounded
+  // Nemotron's response will feel. We pass profile + live attention/HR +
+  // upcoming event + a "voice" directive. The Oracle's Python prompt
+  // template is free to splice any subset into the system prompt; unknown
+  // fields are ignored so older Oracle versions keep working.
   const personalization =
     input.profile && input.profile.episodeCount > 0
       ? {
@@ -129,8 +140,45 @@ async function callOracleBackend(input: {
           top_triggers: input.profile.topTriggers.map((t) => t.trigger),
           best_intervention: input.profile.bestIntervention,
           dominant_pattern: input.profile.dominantPattern,
+          risky_apps: input.profile.riskyApps,
+          // Live context — what's true *right now* for this user.
+          live: {
+            cognitive_state: input.assessment.state,
+            load_score: input.assessment.cognitiveLoadScore,
+            heart_rate_bpm: input.telemetry.heartRate,
+            hrv_ms: input.telemetry.hrv,
+            attention_state: input.attention?.interpretedState ?? 'Unknown',
+            focus_stability: input.attention?.focusStability ?? null,
+            active_app: input.telemetry.activeApp,
+            current_task: input.currentTaskHint ?? input.telemetry.currentTask,
+          },
+          // Forward-look — what's coming up that might compound the load.
+          upcoming_event: input.upcomingEvent ?? null,
+          // Voice directive — even if the Oracle's prompt template ignores
+          // this, it shows up in the JSON payload visible during the demo.
+          voice:
+            input.voice ?? 'socratic',
+          tone_directive:
+            input.voice === 'coach'
+              ? 'Speak directly to the user as their personal wellness coach. One short paragraph. Reference the user_summary and live state by name. Warm, specific, non-judgmental. Offer one concrete next step.'
+              : 'Pose one short Socratic question that re-anchors the user. Reference the dominant_pattern if it fits. No advice, no commands — just the question.',
         }
-      : null;
+      : {
+          // No profile yet — still pass live context + voice so the response
+          // can be grounded in the moment even without history.
+          user_id: 'local',
+          live: {
+            cognitive_state: input.assessment.state,
+            load_score: input.assessment.cognitiveLoadScore,
+            heart_rate_bpm: input.telemetry.heartRate,
+            hrv_ms: input.telemetry.hrv,
+            attention_state: input.attention?.interpretedState ?? 'Unknown',
+            active_app: input.telemetry.activeApp,
+            current_task: input.currentTaskHint ?? input.telemetry.currentTask,
+          },
+          upcoming_event: input.upcomingEvent ?? null,
+          voice: input.voice ?? 'socratic',
+        };
 
   const url = `${baseUrl.replace(/\/$/, '')}/oracle`;
   const controller = new AbortController();
@@ -154,10 +202,11 @@ async function callOracleBackend(input: {
     const json = (await res.json()) as { question?: string; risk_score?: number };
     const question = json.question?.trim();
     if (!question) throw new Error('Oracle returned no question');
-    const personalizedNote = personalization
+    const personalizedNote = input.profile && input.profile.episodeCount > 0
       ? `, personalized for ${input.profile?.userId} (${input.profile?.episodeCount} prior episodes)`
       : '';
-    const rationale = `Generated by Nemotron-3-Super on DGX Spark (Oracle risk=${json.risk_score ?? 0}, signals: hrv_drop=${hrvDrop}, compile_failures=${compileFailures}${personalizedNote}).`;
+    const voiceNote = input.voice === 'coach' ? ', wellness-coach voice' : '';
+    const rationale = `Generated by Nemotron-3-Super on DGX Spark (Oracle risk=${json.risk_score ?? 0}, signals: hrv_drop=${hrvDrop}, compile_failures=${compileFailures}${personalizedNote}${voiceNote}).`;
     return { timestamp: Date.now(), question, rationale };
   } finally {
     clearTimeout(timeout);
@@ -351,18 +400,30 @@ export async function chooseIntervention(input: {
   };
 }
 
-export async function generateSocraticQuestion(input: {
+interface OracleContextInput {
   telemetry: Telemetry;
   assessment: CognitiveAssessment;
   attention?: AttentionMetrics | null;
   profile?: UserProfile | null;
-}): Promise<NemotronCallResult<SocraticPrompt>> {
+  upcomingEvent?: {
+    title: string;
+    tag: string;
+    minutesUntil: number;
+    historicalSignal: string;
+    historicalMatches: number;
+  } | null;
+  currentTaskHint?: string | null;
+}
+
+export async function generateSocraticQuestion(
+  input: OracleContextInput,
+): Promise<NemotronCallResult<SocraticPrompt>> {
   // This IS the visible LLM output. If the team's Oracle backend is
   // configured, route through it for real Nemotron-3-Super generation on
   // the DGX Spark. Otherwise local fallback.
   if (oracleConfigured()) {
     try {
-      const data = await callOracleBackend(input);
+      const data = await callOracleBackend({ ...input, voice: 'socratic' });
       return {
         data,
         fallback: markFallback(false, 'Oracle live (Nemotron-3-Super on DGX Spark).'),
@@ -379,6 +440,63 @@ export async function generateSocraticQuestion(input: {
   return {
     data: localSocratic(input.telemetry, input.assessment),
     fallback: markFallback(true, 'Local reasoning · ORACLE_BACKEND_URL not set.'),
+  };
+}
+
+/**
+ * Wellness-coach voice. Same Oracle backend, different `voice` directive
+ * in the sidecar — Nemotron returns a longer, warmer check-in instead of
+ * a short Socratic question. Fired only on state transitions (Yellow→Red,
+ * Red→Green) so the latency cost is bounded and the message stays sacred.
+ */
+export async function generateCoachCheckin(
+  input: OracleContextInput,
+): Promise<NemotronCallResult<SocraticPrompt>> {
+  if (oracleConfigured()) {
+    try {
+      const data = await callOracleBackend({ ...input, voice: 'coach' });
+      return {
+        data,
+        fallback: markFallback(false, 'Oracle live (Nemotron-3-Super on DGX Spark).'),
+      };
+    } catch (err) {
+      const reason = `Oracle unreachable (${(err as Error).message}). Using local coach fallback.`;
+      console.warn('[oracle:coach]', reason);
+      return {
+        data: localCoachFallback(input.telemetry, input.assessment, input.profile ?? null),
+        fallback: markFallback(true, reason),
+      };
+    }
+  }
+  return {
+    data: localCoachFallback(input.telemetry, input.assessment, input.profile ?? null),
+    fallback: markFallback(true, 'Local reasoning · ORACLE_BACKEND_URL not set.'),
+  };
+}
+
+function localCoachFallback(
+  t: Telemetry,
+  a: CognitiveAssessment,
+  profile: UserProfile | null,
+): SocraticPrompt {
+  const episodeRef =
+    profile && profile.episodeCount > 0
+      ? `Based on your ${profile.episodeCount} prior episodes, `
+      : '';
+  const interventionRef =
+    profile?.bestIntervention
+      ? `${profile.bestIntervention.replace(/_/g, ' ')} has been your most reliable lift — want to run it?`
+      : `let's try a short reset and see how the next 5 minutes feel.`;
+  const stateRef =
+    a.state === 'Red'
+      ? `Your load is at ${a.cognitiveLoadScore} — that's a real spike, not just noise.`
+      : a.state === 'Yellow'
+        ? `Load's climbing (${a.cognitiveLoadScore}) but you're not pinned yet.`
+        : `Nice landing — load's back to ${a.cognitiveLoadScore}.`;
+  return {
+    timestamp: Date.now(),
+    question: `${stateRef} ${episodeRef}${interventionRef}`,
+    rationale: 'Local coach fallback (Oracle unreachable).',
   };
 }
 

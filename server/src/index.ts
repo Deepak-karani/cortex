@@ -26,6 +26,13 @@ import {
   recordAppContext,
 } from '../memory/appContextTracker';
 import {
+  addEvent,
+  listEvents,
+  reseed,
+  type CalendarEvent,
+} from '../calendar/calendarStore';
+import { correlateUpcomingEvent } from '../calendar/eventCorrelator';
+import {
   getAuditLog,
   getAuditSummary,
   rehearsePolicy,
@@ -33,6 +40,7 @@ import {
 } from '../tools/policy';
 import { TOOL_NAMES } from '../tools/cortexTools';
 import { getFallbackStatus } from '../agents/nemotronAgent';
+import { wellnessCoach, type CoachMessage } from '../agents/wellnessCoach';
 import { getRuntimeHealth, probeRuntime, startRuntimeHealthLoop } from '../agents/openclawRuntime';
 import {
   clearLatestAttention,
@@ -232,6 +240,47 @@ subscribeAudit((entry) => {
   io.emit('policy:audit', entry);
 });
 
+// Pipe wellness-coach messages straight through to the dashboard.
+wellnessCoach.on('message', (msg: CoachMessage) => {
+  io.emit('coach:message', msg);
+});
+
+// Calendar heartbeat — recompute the upcoming-event correlation every 30s
+// and broadcast it. Fires a one-shot `calendar:preempt` event the first
+// time a "risky"/"mild" event crosses inside a 10-minute window, so the
+// dashboard can stage the preemptive callout.
+let lastPreemptFiredFor: string | null = null;
+const PREEMPT_WINDOW_MS = 10 * 60 * 1000;
+async function calendarTick(): Promise<void> {
+  try {
+    const userId = defaultUserId();
+    const result = await correlateUpcomingEvent(userId);
+    io.emit('calendar:upcoming', result);
+    if (!result.event) {
+      lastPreemptFiredFor = null;
+      return;
+    }
+    const timeUntil = result.event.startsAt - Date.now();
+    const shouldPreempt =
+      timeUntil > 0 &&
+      timeUntil <= PREEMPT_WINDOW_MS &&
+      (result.correlation.signal === 'risky' || result.correlation.signal === 'mild') &&
+      lastPreemptFiredFor !== result.event.id;
+    if (shouldPreempt) {
+      lastPreemptFiredFor = result.event.id;
+      io.emit('calendar:preempt', result);
+      console.log(
+        `[calendar] preempt fired for ${result.event.title} (${result.correlation.signal}, ${Math.round(timeUntil / 1000)}s until start)`,
+      );
+    }
+  } catch (err) {
+    console.warn('[calendar] tick failed:', (err as Error).message);
+  }
+}
+setInterval(() => void calendarTick(), 30_000);
+// Kick once at boot so the dashboard has data before the first tick lands.
+void calendarTick();
+
 // DGX compute telemetry — emit every 2s so the HUD pulse is always alive.
 setInterval(() => {
   io.emit('compute:update', orchestrator.getComputeTelemetry());
@@ -259,6 +308,11 @@ sim.on('telemetry', async (rawTelemetry: Telemetry) => {
   lastAssessment = assessment;
   io.emit('cognitive:update', assessment);
 
+  // Wellness coach — fires asynchronously on cognitive state transitions
+  // (Yellow→Red, Red→Green, Green→Red, Green→Yellow). Non-blocking; the
+  // emit fires whenever Oracle responds.
+  wellnessCoach.runIfTransition(assessment, telemetry, getLatestAttention());
+
   // Track overload episodes for memory persistence.
   if (assessment.state === 'Yellow' || assessment.state === 'Red') {
     if (lastNonGreenState === null) {
@@ -283,6 +337,15 @@ sim.on('telemetry', async (rawTelemetry: Telemetry) => {
     if (telemetry.errorRate > 0.08) drivers.push('Error churn');
 
     const userId = defaultUserId();
+    // Tag the episode with whatever calendar event was active at the time
+    // (or within a 5-minute halo after it ended, so a meeting that just
+    // wrapped still gets credit for the residual stress it caused).
+    const userEvents = await listEvents(userId).catch(() => [] as CalendarEvent[]);
+    const now = Date.now();
+    const activeEvent = userEvents.find(
+      (e) => now >= e.startsAt - 60_000 && now <= e.endsAt + 5 * 60_000,
+    );
+
     const record: MemoryRecord = {
       id: makeMemoryId(),
       timestamp: Date.now(),
@@ -299,6 +362,7 @@ sim.on('telemetry', async (rawTelemetry: Telemetry) => {
       recoveryTimeSeconds,
       userId,
       drivers,
+      eventTag: activeEvent?.eventTag,
     };
     try {
       await saveMemory(record);
@@ -308,6 +372,11 @@ sim.on('telemetry', async (rawTelemetry: Telemetry) => {
       // aggregate so the dashboard's personalization pill stays accurate.
       const profile = await getUserProfile(userId);
       io.emit('profile:update', profile);
+      // The newly persisted episode may change the upcoming-event
+      // correlation (especially if it just got tagged with eventTag).
+      // Push the fresh verdict so the calendar tile updates immediately.
+      const corr = await correlateUpcomingEvent(userId);
+      io.emit('calendar:upcoming', corr);
     } catch (err) {
       console.error('Failed to persist memory record', err);
     }
@@ -573,6 +642,56 @@ app.post('/api/policy/rehearse', (_req, res) => {
   res.json({ ok: true, count: entries.length, summary: getAuditSummary() });
 });
 
+// Calendar endpoints. The store re-seeds itself if the on-disk arc is
+// older than an hour, so a demo run hours after first boot still has
+// fresh upcoming events.
+app.get('/api/calendar/events', async (req, res) => {
+  const userId = (req.query.userId as string | undefined) ?? defaultUserId();
+  const events = await listEvents(userId);
+  res.json({ ok: true, events });
+});
+
+app.get('/api/calendar/upcoming', async (req, res) => {
+  const userId = (req.query.userId as string | undefined) ?? defaultUserId();
+  const result = await correlateUpcomingEvent(userId);
+  res.json({ ok: true, ...result });
+});
+
+app.get('/api/coach/latest', (_req, res) => {
+  res.json({ ok: true, message: wellnessCoach.getLatest() });
+});
+
+app.post('/api/calendar/reseed', async (req, res) => {
+  const userId = (req.query.userId as string | undefined) ?? defaultUserId();
+  const events = await reseed(userId);
+  const corr = await correlateUpcomingEvent(userId);
+  io.emit('calendar:upcoming', corr);
+  res.json({ ok: true, events });
+});
+
+app.post('/api/calendar/event', async (req, res) => {
+  const body = req.body as Partial<CalendarEvent>;
+  if (!body?.title || !body?.eventTag || !body?.startsAt || !body?.endsAt) {
+    return res.status(400).json({
+      ok: false,
+      error: 'title, eventTag, startsAt, endsAt are required',
+    });
+  }
+  const userId = body.userId ?? defaultUserId();
+  const event = await addEvent({
+    userId,
+    title: body.title,
+    eventTag: body.eventTag,
+    startsAt: Number(body.startsAt),
+    endsAt: Number(body.endsAt),
+    attendees: body.attendees,
+    notes: body.notes,
+  });
+  const corr = await correlateUpcomingEvent(userId);
+  io.emit('calendar:upcoming', corr);
+  return res.json({ ok: true, event });
+});
+
 app.post('/demo/start', (_req, res) => {
   sim.start();
   res.json({ ok: true, running: sim.isRunning() });
@@ -586,8 +705,10 @@ app.post('/demo/reset', async (_req, res) => {
   clearLatestAttention();
   clearLatestScreen();
   clearLatestScreenAnalysis();
+  wellnessCoach.reset();
   io.emit('agent:trace:reset', { timestamp: Date.now() });
   io.emit('task:update', null);
+  io.emit('coach:message', null);
   res.json({ ok: true });
 });
 
@@ -722,6 +843,17 @@ io.on('connection', async (socket) => {
   socket.emit('memory:update', await loadMemories(bootstrapUserId));
   socket.emit('profile:update', await getUserProfile(bootstrapUserId));
   socket.emit('policy:bootstrap', { audit: getAuditLog(), summary: getAuditSummary() });
+  // Calendar bootstrap — push the next event + correlation so the
+  // UpcomingEventCard renders immediately on dashboard load.
+  try {
+    const upcoming = await correlateUpcomingEvent(bootstrapUserId);
+    socket.emit('calendar:upcoming', upcoming);
+  } catch (err) {
+    console.warn('[calendar] bootstrap failed:', (err as Error).message);
+  }
+  // Coach bootstrap — push the most recent coach message if one exists.
+  const lastCoach = wellnessCoach.getLatest();
+  if (lastCoach) socket.emit('coach:message', lastCoach);
   const attentionSnapshot = getLatestAttention();
   if (attentionSnapshot) socket.emit('attention:update', attentionSnapshot);
   const screenSnapshot = getLatestScreen();

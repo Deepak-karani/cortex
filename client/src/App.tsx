@@ -17,6 +17,8 @@ import { PrivacyPanel } from './components/dashboard/PrivacyPanel';
 import { OnboardingBar } from './components/dashboard/OnboardingBar';
 import { PolicySandboxPanel } from './components/dashboard/PolicySandboxPanel';
 import { PersonalizationCallout } from './components/dashboard/PersonalizationCallout';
+import { UpcomingEventCard } from './components/dashboard/UpcomingEventCard';
+import { WellnessCoachPanel } from './components/dashboard/WellnessCoachPanel';
 import type { AttentionMetrics, ScreenSummary } from './types';
 
 export default function App() {
@@ -146,11 +148,20 @@ export default function App() {
         </div>
 
         <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
-          <div className="lg:col-span-2">
-            <TimelinePanel />
+          <div className="lg:col-span-1">
+            <UpcomingEventCard />
+          </div>
+          <div className="lg:col-span-1">
+            <WellnessCoachPanel />
           </div>
           <div className="lg:col-span-1">
             <PolicySandboxPanel />
+          </div>
+        </div>
+
+        <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
+          <div className="lg:col-span-3">
+            <TimelinePanel />
           </div>
         </div>
 
