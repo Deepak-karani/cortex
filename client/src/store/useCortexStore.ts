@@ -432,6 +432,31 @@ export const useCortexStore = create<CortexStore>((set, get) => ({
     s.on('connect', () => set((st) => ({ system: { ...st.system, socketConnected: true } })));
     s.on('disconnect', () => set((st) => ({ system: { ...st.system, socketConnected: false } })));
 
+    // Real Apple Watch / HealthKit sample arrived via the bridge endpoint.
+    // Mark the source as real so the UI flips its label, then surface a
+    // timeline note the FIRST time it happens so judges see "connected".
+    s.on('biometrics:hr', (sample: { bpm: number; hrv: number | null; source: string; timestamp: number }) => {
+      const prevName = heartRate.name;
+      heartRate.markRealSample(sample.source);
+      set((state) => {
+        const events = [...state.timeline];
+        if (prevName === 'Apple Watch Sim' && heartRate.name !== prevName) {
+          events.unshift({
+            id: id(),
+            timestamp: sample.timestamp,
+            kind: 'note',
+            title: 'Apple Watch connected',
+            detail: `Live HealthKit stream from ${sample.source}`,
+            severity: 'info',
+          });
+        }
+        return {
+          heartRate: { ...state.heartRate, source: heartRate.name },
+          timeline: events.slice(0, MAX_TIMELINE),
+        };
+      });
+    });
+
     s.on('telemetry:update', (t: Telemetry) => {
       heartRate.feedFromServer(t);
       set((state) => {

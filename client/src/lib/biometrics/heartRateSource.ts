@@ -28,11 +28,15 @@ export interface HeartRateSource {
  * via socket telemetry. This source can either pipe those into a subscriber
  * via the `feedFromServer` mechanism or generate its own samples.
  */
+const REAL_TTL_MS = 90_000;
+
 class AppleWatchSimSource implements HeartRateSource {
   name = 'Apple Watch Sim';
   private subs = new Set<(s: HeartRateSample) => void>();
   private connected = false;
   private trendBuffer: number[] = [];
+  private lastRealSampleAt = 0;
+  private currentSourceLabel = 'Apple Watch Sim';
 
   isConnected() {
     return this.connected;
@@ -55,26 +59,43 @@ class AppleWatchSimSource implements HeartRateSource {
   }
 
   /**
+   * Called whenever a real HealthKit sample arrives via the bridge endpoint.
+   * Marks the source as "real" for the TTL window so future telemetry ticks
+   * are labeled correctly even if they were authored by the server sim.
+   */
+  markRealSample(label: string) {
+    this.lastRealSampleAt = Date.now();
+    this.currentSourceLabel = label || 'Apple Watch · HealthKit';
+    this.name = this.currentSourceLabel;
+  }
+
+  /**
    * Hook used by the websocket layer to push the server's authoritative
    * biometric stream into this source. The source then derives trend +
    * stress and broadcasts to subscribers — same contract a real Apple Watch
    * BLE bridge would use.
    */
   feedFromServer(t: Telemetry) {
+    // Decay the "real source" label once samples stop arriving.
+    if (this.lastRealSampleAt && Date.now() - this.lastRealSampleAt > REAL_TTL_MS) {
+      this.lastRealSampleAt = 0;
+      this.currentSourceLabel = 'Apple Watch Sim';
+      this.name = this.currentSourceLabel;
+    }
     this.trendBuffer.push(t.heartRate);
     if (this.trendBuffer.length > 8) this.trendBuffer.shift();
     const trend = this.deriveTrend();
-    // Stress proxy: high HR + low HRV.
     const stress = Math.max(
       0,
       Math.min(1, (t.heartRate - 70) / 60 + (70 - t.hrv) / 70),
     );
+    const isReal = !!this.lastRealSampleAt && Date.now() - this.lastRealSampleAt < REAL_TTL_MS;
     const sample: HeartRateSample = {
       bpm: t.heartRate,
       hrv: t.hrv,
       trend,
       stressEstimate: Math.max(0, Math.min(1, stress / 2)),
-      source: 'apple_watch_sim',
+      source: isReal ? 'apple_health' : 'apple_watch_sim',
       timestamp: t.timestamp,
     };
     this.subs.forEach((cb) => cb(sample));

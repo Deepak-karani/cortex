@@ -1,7 +1,8 @@
 import { motion } from 'framer-motion';
-import { Check, ChevronDown, Lock, ShieldCheck, X } from 'lucide-react';
+import { Check, ChevronDown, ExternalLink, HeartPulse, Lock, ShieldCheck, X } from 'lucide-react';
 import { useState } from 'react';
 import { useCortexStore } from '../../store/useCortexStore';
+import { SERVER_URL } from '../../lib/constants';
 
 interface Props {
   webcamEnabled: boolean;
@@ -66,6 +67,33 @@ export function PrivacyPanel({ webcamEnabled, screenEnabled, onToggleWebcam, onT
               <li>· Cortex never performs facial identity recognition.</li>
               <li>· Memory store is a local JSON file under <code className="text-cortex-violet">server/data/memory.json</code>.</li>
             </ul>
+          </div>
+
+          <div className="md:col-span-2 rounded-lg bg-nv-green/5 border border-nv-green/30 p-3 text-[12px] text-cortex-ink/85 leading-snug">
+            <div className="flex items-center gap-1.5 text-nv-green text-[10px] uppercase tracking-widest font-mono mb-1.5">
+              <HeartPulse className="w-3 h-3" />
+              connect a real Apple Watch
+            </div>
+            <p>
+              The heart rate card shows live HealthKit data when an iPhone Shortcut POSTs to:
+            </p>
+            <div className="mt-1.5 mb-2 rounded bg-cortex-bg/60 border border-cortex-border/60 p-2 font-mono text-[11px] text-cortex-accent select-all break-all">
+              {SERVER_URL}/api/biometrics/heart-rate
+            </div>
+            <p className="text-cortex-dim">
+              Build a Shortcut with <span className="text-cortex-ink/85">Find Health Samples → Get Quantity → POST JSON</span>.
+              Full step-by-step in{' '}
+              <a
+                href="https://github.com/Deepak-karani/cortex/blob/main/docs/APPLE_WATCH.md"
+                target="_blank"
+                rel="noreferrer"
+                className="text-cortex-accent hover:underline inline-flex items-center gap-0.5"
+              >
+                docs/APPLE_WATCH.md
+                <ExternalLink className="w-3 h-3" />
+              </a>
+              .
+            </p>
           </div>
         </motion.div>
       )}

@@ -46,6 +46,26 @@ import type {
 
 const PORT = Number(process.env.PORT ?? 4000);
 const CLIENT_ORIGIN = process.env.CLIENT_ORIGIN ?? 'http://localhost:5173';
+const BIOMETRICS_TOKEN = process.env.BIOMETRICS_TOKEN ?? '';
+const REAL_HR_TTL_MS = 90_000; // how long a real sample suppresses the sim
+
+// In-memory store of the latest HealthKit sample. Polled by the sim loop so
+// the simulated stream can yield to a real device when one is present.
+interface LatestHeartRate {
+  bpm: number;
+  hrv: number | null;
+  source: string;
+  timestamp: number;
+}
+let latestRealHeartRate: LatestHeartRate | null = null;
+
+function isRealHrFresh(): boolean {
+  return !!latestRealHeartRate && Date.now() - latestRealHeartRate.timestamp < REAL_HR_TTL_MS;
+}
+
+function getLatestRealHeartRate(): LatestHeartRate | null {
+  return isRealHrFresh() ? latestRealHeartRate : null;
+}
 
 const app = express();
 app.use(cors({ origin: '*' }));
@@ -183,7 +203,13 @@ setInterval(() => {
 }, 2000);
 
 // Sim → cognitive scoring → broadcast.
-sim.on('telemetry', async (telemetry: Telemetry) => {
+sim.on('telemetry', async (rawTelemetry: Telemetry) => {
+  // If a fresh real HealthKit sample is present, override HR/HRV so the rest
+  // of the system (cognitive model, agents, UI) sees the real device's data.
+  const real = getLatestRealHeartRate();
+  const telemetry: Telemetry = real
+    ? { ...rawTelemetry, heartRate: real.bpm, hrv: real.hrv ?? rawTelemetry.hrv }
+    : rawTelemetry;
   lastTelemetry = telemetry;
   io.emit('telemetry:update', telemetry);
 
@@ -275,6 +301,62 @@ app.get('/health', (_req, res) => {
     fallback: getFallbackStatus(),
     simRunning: sim.isRunning(),
     speed: sim.getSpeed(),
+  });
+});
+
+// ---- HealthKit bridge -------------------------------------------------------
+// POST a single heart-rate sample (typically from an iOS Shortcut that reads
+// HealthKit on the watch's behalf). The bridge accepts the smallest possible
+// payload to make the Shortcut trivial to set up.
+//
+// Body shape:
+//   { "bpm": 64, "hrv": 78, "timestamp": 1700000000000, "source": "Apple Watch" }
+// Only `bpm` is required.
+//
+// Auth (optional): set BIOMETRICS_TOKEN in server/.env to require
+//   Authorization: Bearer <token>
+app.post('/api/biometrics/heart-rate', (req, res) => {
+  if (BIOMETRICS_TOKEN) {
+    const auth = req.header('authorization') ?? '';
+    const presented = auth.replace(/^Bearer\s+/i, '');
+    if (presented !== BIOMETRICS_TOKEN) {
+      return res.status(401).json({ ok: false, error: 'unauthorized' });
+    }
+  }
+  const body = req.body as Partial<LatestHeartRate>;
+  const bpmRaw = Number(body.bpm);
+  if (!Number.isFinite(bpmRaw)) {
+    return res.status(400).json({ ok: false, error: 'bpm must be a number' });
+  }
+  const bpm = Math.max(30, Math.min(220, Math.round(bpmRaw)));
+  const hrvRaw = body.hrv == null ? null : Number(body.hrv);
+  const hrv =
+    hrvRaw != null && Number.isFinite(hrvRaw) ? Math.max(0, Math.min(250, Math.round(hrvRaw))) : null;
+  const ts = Number(body.timestamp);
+  const sample: LatestHeartRate = {
+    bpm,
+    hrv,
+    source: (body.source || 'Apple Watch · HealthKit').toString().slice(0, 48),
+    timestamp: Number.isFinite(ts) && ts > 0 ? ts : Date.now(),
+  };
+  latestRealHeartRate = sample;
+  io.emit('biometrics:hr', sample);
+  return res.json({ ok: true, accepted: sample });
+});
+
+app.get('/api/biometrics/heart-rate', (_req, res) => {
+  res.json({ ok: true, sample: getLatestRealHeartRate() });
+});
+
+// Discovery endpoint — Shortcut configures its POST URL from here.
+app.get('/api/biometrics/heart-rate/endpoint', (req, res) => {
+  const host = req.header('host') ?? `localhost:${PORT}`;
+  const proto = (req.header('x-forwarded-proto') ?? req.protocol ?? 'http').split(',')[0];
+  res.json({
+    ok: true,
+    url: `${proto}://${host}/api/biometrics/heart-rate`,
+    authRequired: !!BIOMETRICS_TOKEN,
+    payload: { bpm: 'number (30–220)', hrv: 'number, optional', timestamp: 'epoch ms, optional', source: 'string, optional' },
   });
 });
 
