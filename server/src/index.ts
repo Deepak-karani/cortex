@@ -69,7 +69,9 @@ function getLatestRealHeartRate(): LatestHeartRate | null {
 
 const app = express();
 app.use(cors({ origin: '*' }));
-app.use(express.json());
+// Bigger body limit for Health Auto Export real-time pushes — they can bundle
+// many samples at once.
+app.use(express.json({ limit: '10mb' }));
 
 const server = http.createServer(app);
 const io = new SocketServer(server, {
@@ -202,18 +204,48 @@ setInterval(() => {
   io.emit('runtime:update', getRuntimeHealth());
 }, 2000);
 
+// EMA-glided displayed BPM. HealthKit only commits new samples every 30-90s
+// even during a workout, so the underlying real bpm steps in chunks. We glide
+// the *displayed* value smoothly toward each new target so the dashboard never
+// looks frozen, and add a tiny natural ±1 wobble (real heart rate has HRV).
+// The agent + cognitive model still see the real underlying value for reasoning.
+let displayedHr: number | null = null;
+
+function glideHr(targetBpm: number, hasRealSample: boolean): number {
+  if (displayedHr == null) {
+    displayedHr = targetBpm;
+    return targetBpm;
+  }
+  // When a real Apple Watch sample is present, glide tightly toward it with a
+  // small natural wobble. When using sim only, let the sim's own variation
+  // come through more (smaller glide influence).
+  const glideRate = hasRealSample ? 0.18 : 0.6;
+  displayedHr = displayedHr * (1 - glideRate) + targetBpm * glideRate;
+  // ±1.2 bpm natural wobble — matches real beat-to-beat HRV.
+  const wobbleAmplitude = hasRealSample ? 1.4 : 0.6;
+  const wobble = (Math.random() - 0.5) * wobbleAmplitude * 2;
+  return Math.round(displayedHr + wobble);
+}
+
 // Sim → cognitive scoring → broadcast.
 sim.on('telemetry', async (rawTelemetry: Telemetry) => {
   // If a fresh real HealthKit sample is present, override HR/HRV so the rest
   // of the system (cognitive model, agents, UI) sees the real device's data.
   const real = getLatestRealHeartRate();
+  const realBpm = real ? real.bpm : rawTelemetry.heartRate;
+  const displayedBpm = glideHr(realBpm, !!real);
   const telemetry: Telemetry = real
-    ? { ...rawTelemetry, heartRate: real.bpm, hrv: real.hrv ?? rawTelemetry.hrv }
+    ? { ...rawTelemetry, heartRate: displayedBpm, hrv: real.hrv ?? rawTelemetry.hrv }
     : rawTelemetry;
   lastTelemetry = telemetry;
   io.emit('telemetry:update', telemetry);
 
-  const assessment = scoreCognitiveLoad(telemetry, getLatestAttention());
+  // For the cognitive model and agent reasoning, use the actual real value
+  // (not the glided displayed one) so decisions are based on truth.
+  const telemetryForReasoning: Telemetry = real
+    ? { ...telemetry, heartRate: realBpm }
+    : telemetry;
+  const assessment = scoreCognitiveLoad(telemetryForReasoning, getLatestAttention());
   lastAssessment = assessment;
   io.emit('cognitive:update', assessment);
 
@@ -316,6 +348,9 @@ app.get('/health', (_req, res) => {
 // Auth (optional): set BIOMETRICS_TOKEN in server/.env to require
 //   Authorization: Bearer <token>
 app.post('/api/biometrics/heart-rate', (req, res) => {
+  console.log(
+    `[biometrics] HR POST from ${req.ip} raw body=${JSON.stringify(req.body)}`,
+  );
   if (BIOMETRICS_TOKEN) {
     const auth = req.header('authorization') ?? '';
     const presented = auth.replace(/^Bearer\s+/i, '');
@@ -325,8 +360,13 @@ app.post('/api/biometrics/heart-rate', (req, res) => {
   }
   const body = req.body as Partial<LatestHeartRate>;
   const bpmRaw = Number(body.bpm);
-  if (!Number.isFinite(bpmRaw)) {
-    return res.status(400).json({ ok: false, error: 'bpm must be a number' });
+  if (!Number.isFinite(bpmRaw) || bpmRaw < 30) {
+    console.warn(`[biometrics] rejected bpm=${body.bpm} (parsed=${bpmRaw})`);
+    return res.status(400).json({
+      ok: false,
+      error: `bpm must be a number ≥ 30; received ${JSON.stringify(body.bpm)}`,
+      hint: 'Check the Dictionary action — the bpm value should be wired to a number variable that contains your heart rate, not to the Health Sample itself or to a unit string.',
+    });
   }
   const bpm = Math.max(30, Math.min(220, Math.round(bpmRaw)));
   const hrvRaw = body.hrv == null ? null : Number(body.hrv);
@@ -391,6 +431,7 @@ function pickLatest(samples: HaeMetric['data'] | undefined): { qty: number; date
 }
 
 app.post('/api/biometrics/health-auto-export', (req, res) => {
+  console.log(`[biometrics] HAE POST from ${req.ip} metric count=${(req.body?.data?.metrics ?? []).length}`);
   if (BIOMETRICS_TOKEN) {
     const auth = req.header('authorization') ?? '';
     const presented = auth.replace(/^Bearer\s+/i, '');
