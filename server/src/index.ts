@@ -204,48 +204,19 @@ setInterval(() => {
   io.emit('runtime:update', getRuntimeHealth());
 }, 2000);
 
-// EMA-glided displayed BPM. HealthKit only commits new samples every 30-90s
-// even during a workout, so the underlying real bpm steps in chunks. We glide
-// the *displayed* value smoothly toward each new target so the dashboard never
-// looks frozen, and add a tiny natural ±1 wobble (real heart rate has HRV).
-// The agent + cognitive model still see the real underlying value for reasoning.
-let displayedHr: number | null = null;
-
-function glideHr(targetBpm: number, hasRealSample: boolean): number {
-  if (displayedHr == null) {
-    displayedHr = targetBpm;
-    return targetBpm;
-  }
-  // When a real Apple Watch sample is present, glide tightly toward it with a
-  // small natural wobble. When using sim only, let the sim's own variation
-  // come through more (smaller glide influence).
-  const glideRate = hasRealSample ? 0.18 : 0.6;
-  displayedHr = displayedHr * (1 - glideRate) + targetBpm * glideRate;
-  // ±1.2 bpm natural wobble — matches real beat-to-beat HRV.
-  const wobbleAmplitude = hasRealSample ? 1.4 : 0.6;
-  const wobble = (Math.random() - 0.5) * wobbleAmplitude * 2;
-  return Math.round(displayedHr + wobble);
-}
-
 // Sim → cognitive scoring → broadcast.
 sim.on('telemetry', async (rawTelemetry: Telemetry) => {
   // If a fresh real HealthKit sample is present, override HR/HRV so the rest
   // of the system (cognitive model, agents, UI) sees the real device's data.
+  // No smoothing, no wobble — display exactly what HealthKit reported.
   const real = getLatestRealHeartRate();
-  const realBpm = real ? real.bpm : rawTelemetry.heartRate;
-  const displayedBpm = glideHr(realBpm, !!real);
   const telemetry: Telemetry = real
-    ? { ...rawTelemetry, heartRate: displayedBpm, hrv: real.hrv ?? rawTelemetry.hrv }
+    ? { ...rawTelemetry, heartRate: real.bpm, hrv: real.hrv ?? rawTelemetry.hrv }
     : rawTelemetry;
   lastTelemetry = telemetry;
   io.emit('telemetry:update', telemetry);
 
-  // For the cognitive model and agent reasoning, use the actual real value
-  // (not the glided displayed one) so decisions are based on truth.
-  const telemetryForReasoning: Telemetry = real
-    ? { ...telemetry, heartRate: realBpm }
-    : telemetry;
-  const assessment = scoreCognitiveLoad(telemetryForReasoning, getLatestAttention());
+  const assessment = scoreCognitiveLoad(telemetry, getLatestAttention());
   lastAssessment = assessment;
   io.emit('cognitive:update', assessment);
 
