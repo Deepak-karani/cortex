@@ -8,6 +8,7 @@ import type {
 import { recallSimilarMemory } from '../memory/memoryStore';
 import { simulateFutures } from '../sim/futureSimulator';
 import { checkAttentionState } from './checkAttentionState';
+import { analyzeScreenContext } from './analyzeScreenContext';
 
 export type ToolName =
   | 'recall_memory'
@@ -20,6 +21,7 @@ export type ToolName =
   | 'dim_secondary_monitor'
   | 'ask_socratic'
   | 'check_attention_state'
+  | 'analyze_screen_context'
   | 'do_nothing';
 
 interface ToolContext {
@@ -173,6 +175,10 @@ async function check_attention_state_tool(_ctx: ToolContext): Promise<ToolResult
   return checkAttentionState();
 }
 
+async function analyze_screen_context_tool(_ctx: ToolContext): Promise<ToolResult> {
+  return analyzeScreenContext();
+}
+
 const registry: Record<ToolName, (ctx: ToolContext) => Promise<ToolResult>> = {
   recall_memory,
   simulate_futures,
@@ -184,6 +190,7 @@ const registry: Record<ToolName, (ctx: ToolContext) => Promise<ToolResult>> = {
   dim_secondary_monitor,
   ask_socratic,
   check_attention_state: check_attention_state_tool,
+  analyze_screen_context: analyze_screen_context_tool,
   do_nothing,
 };
 
@@ -201,6 +208,8 @@ export const TOOL_DESCRIPTIONS: Record<ToolName, string> = {
   ask_socratic: 'Surface one Socratic question instead of a notification.',
   check_attention_state:
     'Read the latest webcam-derived attention metrics (gaze, blink rate, focus stability) to confirm or refute the biometric story.',
+  analyze_screen_context:
+    'Read the latest screen analysis (active app, current file, task type, intent, evidence) to understand what the user is actually doing before choosing an intervention.',
   do_nothing: 'Explicitly choose not to intervene this tick.',
 };
 

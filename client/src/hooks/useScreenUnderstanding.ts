@@ -12,6 +12,10 @@ export interface UseScreenResult {
   stop: () => void;
   startSimulated: () => void;
   source: 'capture' | 'simulated' | null;
+  /** Internal video element so a small preview can be attached to the dashboard. */
+  videoElement: HTMLVideoElement | null;
+  /** Subscribe to JPEG frames (base64, ~one per 6s). For VLM uplink. */
+  onFrame: (cb: (jpegBase64: string) => void) => void;
 }
 
 const SIMULATED_ARCS = [
@@ -79,6 +83,7 @@ export function useScreenUnderstanding(
   const captureRef = useRef(createScreenCapture());
   const simTimerRef = useRef<number | null>(null);
   const onSummaryRef = useRef(onSummary);
+  const onFrameSubsRef = useRef<((b64: string) => void)[]>([]);
   useEffect(() => {
     onSummaryRef.current = onSummary;
   }, [onSummary]);
@@ -86,6 +91,7 @@ export function useScreenUnderstanding(
   const [summary, setSummary] = useState<ScreenSummary | null>(null);
   const [status, setStatus] = useState<CaptureStatus>({ kind: 'idle' });
   const [source, setSource] = useState<'capture' | 'simulated' | null>(null);
+  const [videoElement, setVideoElement] = useState<HTMLVideoElement | null>(null);
 
   useEffect(() => {
     const cap = captureRef.current;
@@ -93,10 +99,22 @@ export function useScreenUnderstanding(
       setSummary(s);
       setSource(s.source);
       onSummaryRef.current(s);
+      // Update the cached video ref each tick (the capture pipeline lazily
+      // creates the video element on start).
+      const v = cap.getVideoElement();
+      if (v !== videoElement) setVideoElement(v);
     });
     cap.onStatus((s) => setStatus(s));
+    cap.onFrame((b64) => {
+      onFrameSubsRef.current.forEach((cb) => cb(b64));
+    });
     return () => cap.stop();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  const onFrame = (cb: (b64: string) => void) => {
+    onFrameSubsRef.current.push(cb);
+  };
 
   const stopSim = useCallback(() => {
     if (simTimerRef.current) {
@@ -145,7 +163,9 @@ export function useScreenUnderstanding(
   }, [stopSim]);
 
   return useMemo(
-    () => ({ summary, status, start, stop, startSimulated, source }),
-    [summary, status, start, stop, startSimulated, source],
+    () => ({ summary, status, start, stop, startSimulated, source, videoElement, onFrame }),
+    // onFrame is referentially stable across renders (closure over ref)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [summary, status, start, stop, startSimulated, source, videoElement],
   );
 }

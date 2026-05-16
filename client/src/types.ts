@@ -214,3 +214,31 @@ export interface RuntimeHealth {
   lastCheckedAt: number;
   notes: string[];
 }
+
+// ============================================================
+// Screen analysis (mirrored from server)
+// ============================================================
+
+export type TaskType =
+  | 'coding'
+  | 'debugging'
+  | 'reading'
+  | 'communicating'
+  | 'designing'
+  | 'browsing'
+  | 'writing'
+  | 'meeting'
+  | 'unknown';
+
+export interface ScreenAnalysis {
+  timestamp: number;
+  activeApp: string;
+  currentFile: string | null;
+  visibleProject: string | null;
+  userIntent: string;
+  taskType: TaskType;
+  confidence: number;
+  visibleSignals: string[];
+  summary: string;
+  source: 'vlm' | 'ocr_heuristic' | 'simulated';
+}

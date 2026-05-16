@@ -212,7 +212,23 @@ export class Orchestrator extends EventEmitter {
     lastFallback = analysis.fallback;
     push(trace('thought', `[nemotron] ${analysis.data.thought}`, { payload: { agent: 'orchestrator' } }));
 
-    // 5) Always probe attention as the canonical tool call.
+    // 5a) Probe screen context first — what the user is actually doing matters
+    //     more than any single biometric signal.
+    push(trace('tool_call', 'Calling analyze_screen_context.', { toolName: 'analyze_screen_context' }));
+    const screenResult = await runTool('analyze_screen_context', {
+      telemetry: input.telemetry,
+      assessment: input.assessment,
+    });
+    this.toolCalls.push(Date.now());
+    toolResults.push(screenResult);
+    push(
+      trace('tool_result', screenResult.reason, {
+        toolName: 'analyze_screen_context',
+        payload: screenResult.payload,
+      }),
+    );
+
+    // 5b) Then probe attention.
     push(trace('tool_call', 'Calling check_attention_state.', { toolName: 'check_attention_state' }));
     const attentionResult = await runTool('check_attention_state', {
       telemetry: input.telemetry,
@@ -288,7 +304,7 @@ export class Orchestrator extends EventEmitter {
     }
 
     // 9) Execute remaining tools.
-    const alreadyRan = new Set<ToolName>(['check_attention_state']);
+    const alreadyRan = new Set<ToolName>(['check_attention_state', 'analyze_screen_context']);
     if (input.assessment.state !== 'Green' || criticalInsight) alreadyRan.add('simulate_futures');
 
     for (const toolName of decision.data.tools) {

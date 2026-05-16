@@ -11,6 +11,7 @@ import type {
   MemoryRecord,
   ProductivityInsight,
   RuntimeHealth,
+  ScreenAnalysis,
   ScreenSummary,
   SocraticPrompt,
   Telemetry,
@@ -109,6 +110,8 @@ export interface CortexStore {
     lastUpdated: number | null;
     source: 'capture' | 'simulated' | null;
     switchHistory: { t: number; switches: number }[];
+    /** Rich structured task context derived from the VLM/heuristic analyzer. */
+    analysis: ScreenAnalysis | null;
   };
   agent: {
     status: AgentStatus;
@@ -136,6 +139,9 @@ export interface CortexStore {
 
   pushAttentionToServer: (m: AttentionMetrics) => void;
   pushScreenToServer: (s: ScreenSummary) => void;
+  pushScreenFrame: (jpegBase64: string, hints: ScreenSummary | null) => void;
+  signalScreenStart: () => void;
+  signalScreenStop: () => void;
   applyLocalAttention: (m: AttentionMetrics) => void;
   applyLocalScreen: (s: ScreenSummary) => void;
 
@@ -243,6 +249,7 @@ export const useCortexStore = create<CortexStore>((set, get) => ({
     lastUpdated: null,
     source: null,
     switchHistory: [],
+    analysis: null,
   },
   agent: {
     status: 'idle',
@@ -277,6 +284,19 @@ export const useCortexStore = create<CortexStore>((set, get) => ({
   pushScreenToServer: (s) => {
     socketRef.current?.emit('screen:push', s);
     get().applyLocalScreen(s);
+  },
+  pushScreenFrame: (jpegBase64, hints) => {
+    socketRef.current?.emit('screen:frame', {
+      imageBase64: jpegBase64,
+      summaryHints: hints ?? undefined,
+    });
+  },
+  signalScreenStart: () => {
+    socketRef.current?.emit('screen:start');
+  },
+  signalScreenStop: () => {
+    socketRef.current?.emit('screen:stop');
+    set((state) => ({ screen: { ...state.screen, analysis: null } }));
   },
   applyLocalAttention: (m) =>
     set((s) => {
@@ -513,6 +533,11 @@ export const useCortexStore = create<CortexStore>((set, get) => ({
           },
         };
       });
+    });
+    s.on('task:update', (a: ScreenAnalysis | null) => {
+      set((state) => ({
+        screen: { ...state.screen, analysis: a },
+      }));
     });
     s.on('screen:update', (sc: ScreenSummary) => {
       set((state) => ({

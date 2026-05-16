@@ -1,5 +1,6 @@
 import { motion } from 'framer-motion';
-import { MonitorPlay, Power, Sparkles, Square } from 'lucide-react';
+import { MonitorPlay, Power, ShieldCheck, Sparkles, Square } from 'lucide-react';
+import { useEffect, useRef } from 'react';
 import type { CaptureStatus } from '../../screen/screenCapture';
 import { ContextSwitchChart } from '../charts/ContextSwitchChart';
 import { SignalCard } from './SignalCard';
@@ -7,6 +8,7 @@ import { useCortexStore } from '../../store/useCortexStore';
 
 interface Props {
   status: CaptureStatus;
+  videoElement: HTMLVideoElement | null;
   onShareScreen: () => Promise<void>;
   onStartSimulated: () => void;
   onStop: () => void;
@@ -30,19 +32,38 @@ const WORKFLOW_ACCENT: Record<string, string> = {
   idle: '#6e7aa3',
 };
 
-export function ScreenCard({ status, onShareScreen, onStartSimulated, onStop }: Props) {
+export function ScreenCard({ status, videoElement, onShareScreen, onStartSimulated, onStop }: Props) {
   const screen = useCortexStore((s) => s.screen);
   const accent = WORKFLOW_ACCENT[screen.workflowState] ?? '#a07bff';
+  const previewSlotRef = useRef<HTMLDivElement | null>(null);
+
+  // Attach the screen capture's <video> element into our preview slot.
+  // The video element is the same one OCR + frame-grabber are using, so this
+  // doesn't open a second getDisplayMedia session.
+  useEffect(() => {
+    const slot = previewSlotRef.current;
+    if (!slot) return;
+    if (videoElement && status.kind === 'running') {
+      videoElement.style.width = '100%';
+      videoElement.style.height = '100%';
+      videoElement.style.objectFit = 'cover';
+      videoElement.muted = true;
+      videoElement.playsInline = true;
+      slot.appendChild(videoElement);
+      void videoElement.play().catch(() => {});
+      return () => {
+        if (videoElement.parentElement === slot) slot.removeChild(videoElement);
+      };
+    }
+  }, [videoElement, status.kind]);
 
   const reading = !screen.enabled ? 'Not sharing' : screen.activeApp;
   const interpretation =
-    screen.workflowState === 'debugging' && screen.blocker
-      ? screen.blocker
-      : screen.inferredTask;
+    screen.workflowState === 'debugging' && screen.blocker ? screen.blocker : screen.inferredTask;
 
   return (
     <SignalCard
-      title="Screen Activity"
+      title="Screen Analysis"
       icon={<MonitorPlay className="w-4 h-4" />}
       connected={status.kind === 'running' || screen.source === 'simulated'}
       reading={reading}
@@ -65,7 +86,7 @@ export function ScreenCard({ status, onShareScreen, onStartSimulated, onStop }: 
               onClick={() => void onShareScreen()}
               className="pill border border-cortex-violet/40 text-cortex-violet bg-cortex-violet/10 hover:bg-cortex-violet/20"
             >
-              <Power className="w-3 h-3" /> share
+              <Power className="w-3 h-3" /> start
             </motion.button>
             <motion.button
               whileTap={{ scale: 0.95 }}
@@ -78,45 +99,40 @@ export function ScreenCard({ status, onShareScreen, onStartSimulated, onStop }: 
         )
       }
     >
-      <div className="rounded-xl bg-cortex-bg/50 border border-cortex-border/50 p-3">
-        <div className="flex items-center justify-between mb-1">
-          <span className="text-[10px] uppercase tracking-widest text-cortex-dim font-mono">workflow</span>
-          <span className="pill border" style={{ borderColor: `${accent}55`, color: accent, background: `${accent}15` }}>
-            {WORKFLOW_LABEL[screen.workflowState] ?? screen.workflowState}
+      {/* Live preview when sharing — gives the user immediate visual feedback. */}
+      <div className="relative aspect-[16/10] rounded-xl overflow-hidden bg-cortex-bg/80 border border-cortex-border/50">
+        <div ref={previewSlotRef} className="absolute inset-0" />
+        {status.kind !== 'running' && (
+          <div className="absolute inset-0 grid place-items-center text-cortex-dim font-mono text-[11px] text-center px-3">
+            {status.kind === 'requesting'
+              ? 'Requesting screen share permission…'
+              : status.kind === 'loading_ocr'
+                ? 'Loading OCR engine…'
+                : status.kind === 'denied' || status.kind === 'error'
+                  ? 'Permission denied — using simulated task arc.'
+                  : 'Click Start to let Cortex see what you are working on.'}
+          </div>
+        )}
+        <div className="absolute bottom-1.5 left-1.5 right-1.5 flex items-center justify-between text-[8px] font-mono uppercase tracking-widest text-cortex-dim/90 pointer-events-none">
+          <span className="flex items-center gap-1">
+            <ShieldCheck className="w-3 h-3 text-nv-green" />
+            local
           </span>
-        </div>
-        <div className="text-sm text-cortex-ink/85 leading-snug truncate" title={screen.activeContext}>
-          {screen.activeContext || 'No active context yet.'}
-        </div>
-        <div className="text-[10px] text-cortex-dim font-mono mt-0.5">
-          project · <span className="text-cortex-ink/80">{screen.project || '—'}</span>
+          <span>frames not stored</span>
+          <span>summaries only</span>
         </div>
       </div>
 
-      <div className="grid grid-cols-2 gap-3">
-        <Mini label="context switches/min" value={String(screen.contextSwitchesPerMinute)} warn={screen.contextSwitchesPerMinute > 16} />
-        <Mini label="notifications" value={String(screen.notificationCount)} warn={screen.notificationCount > 18} />
+      <div className="flex items-center justify-between text-[10px] font-mono">
+        <span className="text-cortex-dim">workflow</span>
+        <span className="pill border" style={{ borderColor: `${accent}55`, color: accent, background: `${accent}15` }}>
+          {WORKFLOW_LABEL[screen.workflowState] ?? screen.workflowState}
+        </span>
       </div>
 
       {screen.switchHistory.length > 1 && (
-        <ContextSwitchChart history={screen.switchHistory} height={36} />
+        <ContextSwitchChart history={screen.switchHistory} height={32} />
       )}
-
-      <div className="text-[10px] uppercase tracking-widest text-cortex-dim font-mono">
-        source ·{' '}
-        <span className="text-cortex-ink/80">
-          {screen.source === 'capture' ? 'live capture' : screen.source === 'simulated' ? 'demo arc' : '—'}
-        </span>
-      </div>
     </SignalCard>
-  );
-}
-
-function Mini({ label, value, warn }: { label: string; value: string; warn?: boolean }) {
-  return (
-    <div className="rounded-lg bg-cortex-bg/40 border border-cortex-border/50 p-2">
-      <div className="text-[9px] uppercase tracking-widest text-cortex-dim font-mono">{label}</div>
-      <div className={`text-lg font-display mt-0.5 ${warn ? 'text-cortex-red' : 'text-cortex-ink'}`}>{value}</div>
-    </div>
   );
 }

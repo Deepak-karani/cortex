@@ -37,6 +37,14 @@ export interface CapturePipeline {
   isActive: () => boolean;
   onSummary: (cb: (s: ScreenSummary) => void) => void;
   onStatus: (cb: (status: CaptureStatus) => void) => void;
+  /**
+   * Subscribe to base64 JPEG frames emitted approximately every 6s.
+   * Used by the VLM analysis pipeline. Frames are NOT persisted anywhere —
+   * the canvas is cleared immediately after each callback returns.
+   */
+  onFrame: (cb: (jpegBase64: string) => void) => void;
+  /** Return the internal <video> element so a small preview can be rendered. */
+  getVideoElement: () => HTMLVideoElement | null;
 }
 
 export type CaptureStatus =
@@ -66,6 +74,8 @@ export function createScreenCapture(): CapturePipeline {
   let timer: number | null = null;
   let onSummaryCb: ((s: ScreenSummary) => void) | null = null;
   let onStatusCb: ((s: CaptureStatus) => void) | null = null;
+  let onFrameCb: ((jpegBase64: string) => void) | null = null;
+  let lastFrameEmitAt = 0;
   let active = false;
   let lastTickAt = 0;
   let recentTabHistory: string[] = [];
@@ -96,6 +106,21 @@ export function createScreenCapture(): CapturePipeline {
       rawText = result?.data?.text ?? '';
     } catch (err) {
       warn('OCR failed:', (err as Error).message);
+    }
+
+    // Emit a base64 JPEG frame to subscribers BEFORE clearing the canvas.
+    // We throttle to ~one frame every 6s so VLM/server load stays sane.
+    const nowMs = Date.now();
+    if (onFrameCb && nowMs - lastFrameEmitAt > 5500) {
+      lastFrameEmitAt = nowMs;
+      try {
+        // toDataURL("image/jpeg", 0.55) keeps the frame ~80-180KB at 960px wide.
+        const dataUrl = canvas.toDataURL('image/jpeg', 0.55);
+        const base64 = dataUrl.replace(/^data:image\/jpeg;base64,/, '');
+        onFrameCb(base64);
+      } catch (err) {
+        warn('frame encode failed:', (err as Error).message);
+      }
     }
 
     // CRITICAL: clear the canvas immediately so the frame isn't lingering in
@@ -244,6 +269,10 @@ export function createScreenCapture(): CapturePipeline {
     onStatus: (cb) => {
       onStatusCb = cb;
     },
+    onFrame: (cb) => {
+      onFrameCb = cb;
+    },
+    getVideoElement: () => video,
   };
 }
 

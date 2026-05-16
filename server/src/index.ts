@@ -30,6 +30,12 @@ import {
   getLatestScreen,
   setLatestScreen,
 } from '../sim/screenStore';
+import {
+  analyzeScreenFrame,
+  clearLatestScreenAnalysis,
+  getLatestScreenAnalysis,
+  getVisionFallbackStatus,
+} from '../vision/screenAnalyzer';
 import type {
   AgentReport,
   AgentTraceEntry,
@@ -39,6 +45,7 @@ import type {
   DemoSpeed,
   MemoryRecord,
   ProductivityInsight,
+  ScreenAnalysis,
   ScreenSummary,
   Telemetry,
   ToolResult,
@@ -495,7 +502,9 @@ app.post('/demo/reset', async (_req, res) => {
   episodeInterventions = [];
   clearLatestAttention();
   clearLatestScreen();
+  clearLatestScreenAnalysis();
   io.emit('agent:trace:reset', { timestamp: Date.now() });
+  io.emit('task:update', null);
   res.json({ ok: true });
 });
 
@@ -534,6 +543,23 @@ app.post('/api/screen-state', (req, res) => {
 
 app.get('/api/screen-state', (_req, res) => {
   res.json({ ok: true, screen: getLatestScreen() });
+});
+
+// ---- Screen frame analysis (VLM / heuristic fallback) ----------------------
+// Accepts an optional base64 JPEG plus the existing OCR hints, returns a
+// structured ScreenAnalysis. Throttled by the client to ~1 frame / 6s.
+app.post('/api/screen-frame', async (req, res) => {
+  const body = req.body as { imageBase64?: string; summaryHints?: ScreenSummary } | undefined;
+  const analysis = await analyzeScreenFrame({
+    imageBase64: body?.imageBase64,
+    summaryHints: body?.summaryHints ?? getLatestScreen(),
+  });
+  io.emit('task:update', analysis);
+  res.json({ ok: true, analysis, fallback: getVisionFallbackStatus() });
+});
+
+app.get('/api/task', (_req, res) => {
+  res.json({ ok: true, task: getLatestScreenAnalysis(), fallback: getVisionFallbackStatus() });
 });
 
 app.get('/api/compute', (_req, res) => {
@@ -589,6 +615,8 @@ io.on('connection', async (socket) => {
   if (attentionSnapshot) socket.emit('attention:update', attentionSnapshot);
   const screenSnapshot = getLatestScreen();
   if (screenSnapshot) socket.emit('screen:update', screenSnapshot);
+  const taskSnapshot = getLatestScreenAnalysis();
+  if (taskSnapshot) socket.emit('task:update', taskSnapshot);
   socket.emit('compute:update', orchestrator.getComputeTelemetry());
 
   socket.on('demo:start', () => sim.start());
@@ -611,6 +639,28 @@ io.on('connection', async (socket) => {
     setLatestScreen(sanitized);
     socket.broadcast.emit('screen:update', sanitized);
   });
+  socket.on('screen:start', () => {
+    socket.broadcast.emit('screen:status', { kind: 'running' });
+  });
+  socket.on('screen:stop', () => {
+    clearLatestScreenAnalysis();
+    socket.broadcast.emit('screen:status', { kind: 'idle' });
+    io.emit('task:update', null);
+  });
+  socket.on(
+    'screen:frame',
+    async (payload: { imageBase64?: string; summaryHints?: ScreenSummary } | undefined) => {
+      try {
+        const analysis = await analyzeScreenFrame({
+          imageBase64: payload?.imageBase64,
+          summaryHints: payload?.summaryHints ?? getLatestScreen(),
+        });
+        io.emit('task:update', analysis);
+      } catch (err) {
+        console.warn('[vision] frame analysis failed:', (err as Error).message);
+      }
+    },
+  );
 
   socket.on('disconnect', () => {
     console.log(`socket disconnected: ${socket.id}`);

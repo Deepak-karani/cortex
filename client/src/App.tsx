@@ -1,4 +1,4 @@
-import { useCallback, useEffect } from 'react';
+import { useCallback, useEffect, useState } from 'react';
 import { useAttentionTracking } from './hooks/useAttentionTracking';
 import { useScreenUnderstanding } from './hooks/useScreenUnderstanding';
 import { useRoute } from './hooks/useRoute';
@@ -26,16 +26,42 @@ export default function App() {
 
   const pushAttention = useCortexStore((s) => s.pushAttentionToServer);
   const pushScreen = useCortexStore((s) => s.pushScreenToServer);
+  const pushScreenFrame = useCortexStore((s) => s.pushScreenFrame);
+  const signalScreenStart = useCortexStore((s) => s.signalScreenStart);
+  const signalScreenStop = useCortexStore((s) => s.signalScreenStop);
   const setWebcamEnabled = useCortexStore((s) => s.setWebcamEnabled);
   const setScreenEnabled = useCortexStore((s) => s.setScreenEnabled);
   const startDemo = useCortexStore((s) => s.startDemo);
   const startFocusSprint = useCortexStore((s) => s.startFocusSprint);
+  const [latestScreenHints, setLatestScreenHints] = useState<ReturnType<typeof useScreenUnderstanding>['summary']>(null);
 
   const handleAttention = useCallback((m: AttentionMetrics) => pushAttention(m), [pushAttention]);
-  const handleScreen = useCallback((s: ScreenSummary) => pushScreen(s), [pushScreen]);
+  const handleScreen = useCallback(
+    (s: ScreenSummary) => {
+      pushScreen(s);
+      setLatestScreenHints(s);
+    },
+    [pushScreen],
+  );
 
   const attention = useAttentionTracking(handleAttention);
   const screen = useScreenUnderstanding(handleScreen);
+
+  // Wire screen capture frames → server for VLM analysis. Each frame is ~80KB
+  // base64 JPEG; the capture pipeline emits one every ~6s.
+  useEffect(() => {
+    screen.onFrame((jpegBase64) => {
+      pushScreenFrame(jpegBase64, latestScreenHints);
+    });
+    // intentional: subscribe once
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // Tell the server when screen sharing starts/stops so other clients sync.
+  useEffect(() => {
+    if (screen.status.kind === 'running') signalScreenStart();
+    if (screen.status.kind === 'idle') signalScreenStop();
+  }, [screen.status.kind, signalScreenStart, signalScreenStop]);
 
   // Mirror sub-hook lifecycle into the store so the UI's status pills update.
   useEffect(() => {
@@ -98,6 +124,7 @@ export default function App() {
           />
           <ScreenCard
             status={screen.status}
+            videoElement={screen.videoElement}
             onShareScreen={async () => {
               await screen.start();
             }}
