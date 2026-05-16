@@ -16,6 +16,7 @@ interface Props {
   diagnostic: AttentionDiagnostic;
   onStart: () => void;
   onStop: () => void;
+  compact?: boolean;
 }
 
 const STATE_COLOR: Record<AttentionMetrics['interpretedState'], string> = {
@@ -166,17 +167,19 @@ export function AttentionTile(props: Props) {
             )}
           </div>
 
-          <div className="rounded-md border border-cortex-border/60 bg-cortex-bg/40 px-2 py-1.5 text-[9px] font-mono">
-            <ShieldCheck className="w-3 h-3 inline text-nv-green mr-1" />
-            <span className="text-cortex-dim">permission </span>
-            <span className={props.diagnostic.permissionState === 'denied' ? 'text-cortex-red' : 'text-cortex-ink'}>
-              {props.diagnostic.permissionState}
-            </span>
-            <span className="text-cortex-dim ml-2">cameras </span>
-            <span className={props.diagnostic.cameraDevices === 0 ? 'text-cortex-red' : 'text-cortex-ink'}>
-              {props.diagnostic.cameraDevices}
-            </span>
-          </div>
+          {!props.compact && (
+            <div className="rounded-md border border-cortex-border/60 bg-cortex-bg/40 px-2 py-1.5 text-[9px] font-mono">
+              <ShieldCheck className="w-3 h-3 inline text-nv-green mr-1" />
+              <span className="text-cortex-dim">permission </span>
+              <span className={props.diagnostic.permissionState === 'denied' ? 'text-cortex-red' : 'text-cortex-ink'}>
+                {props.diagnostic.permissionState}
+              </span>
+              <span className="text-cortex-dim ml-2">cameras </span>
+              <span className={props.diagnostic.cameraDevices === 0 ? 'text-cortex-red' : 'text-cortex-ink'}>
+                {props.diagnostic.cameraDevices}
+              </span>
+            </div>
+          )}
         </div>
 
         <div className="col-span-7 space-y-2">

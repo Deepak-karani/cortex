@@ -12,6 +12,7 @@ interface Props {
   onStartCapture: () => Promise<void>;
   onStartSimulated: () => void;
   onStop: () => void;
+  compact?: boolean;
 }
 
 const WORKFLOW_COLOR: Record<ScreenSummary['workflowState'], string> = {
@@ -30,6 +31,7 @@ export function ScreenUnderstanding({
   onStartCapture,
   onStartSimulated,
   onStop,
+  compact = false,
 }: Props) {
   return (
     <Panel
@@ -92,10 +94,12 @@ export function ScreenUnderstanding({
             </button>
           </div>
 
-          <div className="rounded-md border border-cortex-border/40 bg-cortex-bg/40 px-2 py-1.5 text-[10px] font-mono text-cortex-dim">
-            <ShieldCheck className="w-3 h-3 inline text-nv-green mr-1" />
-            <span className="text-cortex-ink">frames discarded after OCR</span> · only tokens leave the browser
-          </div>
+          {!compact && (
+            <div className="rounded-md border border-cortex-border/40 bg-cortex-bg/40 px-2 py-1.5 text-[10px] font-mono text-cortex-dim">
+              <ShieldCheck className="w-3 h-3 inline text-nv-green mr-1" />
+              <span className="text-cortex-ink">frames discarded after OCR</span> · only tokens leave the browser
+            </div>
+          )}
         </div>
 
         <div className="col-span-7 space-y-2 min-w-0">
@@ -114,25 +118,25 @@ export function ScreenUnderstanding({
             </div>
           </div>
 
-          <TokenStream tokens={summary?.ocrTokens ?? []} />
+          {!compact && <TokenStream tokens={summary?.ocrTokens ?? []} />}
 
-          {status.kind === 'running' && status.fps > 0 && (
+          {!compact && status.kind === 'running' && status.fps > 0 && (
             <div className="text-[9px] font-mono text-cortex-dim flex items-center gap-2">
               <Hash className="w-3 h-3" />
               ocr fingerprint <span className="text-cortex-accent">{status.lastHash}</span> · {status.fps} fps
             </div>
           )}
-          {status.kind === 'requesting' && (
+          {!compact && status.kind === 'requesting' && (
             <div className="text-[10px] font-mono text-cortex-yellow flex items-center gap-1">
               <Eye className="w-3 h-3 animate-pulse" /> requesting screen share permission...
             </div>
           )}
-          {status.kind === 'loading_ocr' && (
+          {!compact && status.kind === 'loading_ocr' && (
             <div className="text-[10px] font-mono text-cortex-yellow flex items-center gap-1">
               <FileText className="w-3 h-3 animate-pulse" /> loading OCR engine (≈3MB WASM, first time only)...
             </div>
           )}
-          {(status.kind === 'denied' || status.kind === 'error') && (
+          {!compact && (status.kind === 'denied' || status.kind === 'error') && (
             <div className="text-[10px] font-mono text-cortex-orange">
               {status.reason} — running simulated arc instead.
             </div>

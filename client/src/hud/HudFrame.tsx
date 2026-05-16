@@ -1,5 +1,6 @@
 import { motion } from 'framer-motion';
 import { Activity, Cpu, Eye, ShieldCheck, Wifi, WifiOff } from 'lucide-react';
+import type { ReactNode } from 'react';
 import type {
   AttentionMetrics,
   CognitiveAssessment,
@@ -15,9 +16,10 @@ interface Props {
   attention: AttentionMetrics | null;
   screen: ScreenSummary | null;
   compute: ComputeTelemetry | null;
+  rightSlot?: ReactNode;
 }
 
-export function HudFrame({ connected, assessment, fallback, attention, screen, compute }: Props) {
+export function HudFrame({ connected, assessment, fallback, attention, screen, compute, rightSlot }: Props) {
   const stateColor =
     assessment?.state === 'Red'
       ? 'text-cortex-red'
@@ -109,6 +111,7 @@ export function HudFrame({ connected, assessment, fallback, attention, screen, c
             label={connected ? 'socket' : 'offline'}
             sub={connected ? 'live' : 'lost'}
           />
+          {rightSlot && <div className="ml-2 pl-3 border-l border-cortex-border/60">{rightSlot}</div>}
         </div>
       </div>
     </header>
