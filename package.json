@@ -1,0 +1,17 @@
+{
+  "name": "cortex-arena",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Cortex Arena — autonomous cognitive operating system that predicts overload before it happens.",
+  "scripts": {
+    "install:all": "npm install && npm --prefix server install && npm --prefix client install",
+    "dev": "concurrently -n server,client -c blue,magenta \"npm run server\" \"npm run client\"",
+    "server": "npm --prefix server run dev",
+    "client": "npm --prefix client run dev",
+    "build": "npm --prefix server run build && npm --prefix client run build",
+    "start": "npm --prefix server start"
+  },
+  "devDependencies": {
+    "concurrently": "^8.2.2"
+  }
+}
