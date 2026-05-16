@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import type { AttentionHeatPoint, AttentionMetrics } from '../types';
-import type { WebcamStatus } from '../hooks/useAttentionTracking';
+import type { AttentionDiagnostic, WebcamStatus } from '../hooks/useAttentionTracking';
 
 interface Props {
   videoRef: React.RefObject<HTMLVideoElement>;
@@ -11,6 +11,7 @@ interface Props {
   fps: number;
   source: 'webcam' | 'simulated' | null;
   streamActive: boolean;
+  diagnostic: AttentionDiagnostic;
   onStart: () => void;
   onStop: () => void;
 }
@@ -30,6 +31,12 @@ const INTERPRETED_PALETTE: Record<
     bg: 'bg-cortex-red/10',
     ring: 'ring-cortex-red/40',
     description: 'Gaze repeatedly leaving the screen.',
+  },
+  Unknown: {
+    text: 'text-cortex-dim',
+    bg: 'bg-cortex-dim/10',
+    ring: 'ring-cortex-dim/40',
+    description: 'Signal unreliable — no face or low confidence.',
   },
   Fatigued: {
     text: 'text-cortex-violet',
@@ -69,7 +76,7 @@ export default function AttentionPanel(props: Props) {
   const isLive = props.streamActive;
 
   return (
-    <div className={`panel relative overflow-hidden flex-1 min-h-0 flex flex-col`}>
+    <div className={`panel relative flex-shrink-0 flex flex-col`}>
       <div className="panel-header">
         <span>attention tracking · webcam mesh</span>
         <span className={props.status === 'running' ? 'text-cortex-accent' : 'text-cortex-yellow'}>
@@ -143,13 +150,19 @@ export default function AttentionPanel(props: Props) {
               </button>
             ) : (
               <button
-                onClick={props.onStart}
+                onClick={() => {
+                  console.log('[attention] BUTTON CLICKED');
+                  props.onStart();
+                }}
                 className="flex-1 px-2 py-1.5 rounded-md bg-cortex-accent/10 border border-cortex-accent/50 text-cortex-accent font-mono text-[11px] uppercase tracking-widest hover:bg-cortex-accent/20 shadow-glow"
               >
                 {props.status === 'idle' ? 'enable camera' : 'retry camera'}
               </button>
             )}
           </div>
+
+          {/* Live diagnostic — surfaces the exact reason if camera fails */}
+          <DiagnosticBanner diagnostic={props.diagnostic} status={props.status} errorMessage={props.errorMessage} />
         </div>
 
         {/* RIGHT: numbers + interpretation + stability sparkline */}
@@ -218,6 +231,16 @@ export default function AttentionPanel(props: Props) {
               label="face detected"
               value={props.metrics?.faceDetected ? 'yes' : 'no'}
               warn={!props.metrics?.faceDetected && props.status === 'running'}
+            />
+            <Stat
+              label="head pose"
+              value={props.metrics?.headPose ?? '—'}
+              warn={!!props.metrics && props.metrics.headPose === 'away'}
+            />
+            <Stat
+              label="confidence"
+              value={props.metrics ? `${Math.round(props.metrics.confidence * 100)}%` : '—'}
+              warn={!!props.metrics && props.metrics.confidence < 0.35}
             />
           </div>
 
@@ -352,6 +375,87 @@ function GazeIndicator({ direction }: { direction: AttentionMetrics['gazeDirecti
     <div className="absolute top-1 left-1 font-mono text-[10px] uppercase tracking-widest bg-cortex-bg/70 px-1.5 py-0.5 rounded flex items-center gap-1">
       <span style={{ color }}>{arrow[direction]}</span>
       <span style={{ color }}>{direction}</span>
+    </div>
+  );
+}
+
+function DiagnosticBanner({
+  diagnostic,
+  status,
+  errorMessage,
+}: {
+  diagnostic: AttentionDiagnostic;
+  status: WebcamStatus;
+  errorMessage: string | null;
+}) {
+  // Decide the headline that explains why camera isn't on.
+  let headline: { color: string; text: string; tip: string } | null = null;
+
+  if (!diagnostic.secureContext) {
+    headline = {
+      color: 'text-cortex-red border-cortex-red/40 bg-cortex-red/10',
+      text: 'Insecure context — getUserMedia is blocked.',
+      tip: `Open this page via http://localhost:5173 (not an IP or LAN address). Current origin: ${diagnostic.origin}`,
+    };
+  } else if (!diagnostic.mediaDevicesAvailable) {
+    headline = {
+      color: 'text-cortex-red border-cortex-red/40 bg-cortex-red/10',
+      text: 'navigator.mediaDevices is undefined — browser cannot access camera at all.',
+      tip: 'Use Chrome, Arc, Brave, Firefox, or Safari. Some embedded browsers (Electron / in-app webviews) disable this.',
+    };
+  } else if (diagnostic.cameraDevices === 0 && status !== 'requesting' && status !== 'loading_model') {
+    headline = {
+      color: 'text-cortex-yellow border-cortex-yellow/40 bg-cortex-yellow/10',
+      text: 'No camera devices visible to the browser.',
+      tip: 'Camera may be claimed by another app (FaceTime, Photo Booth, Zoom). Quit those, then click retry.',
+    };
+  } else if (diagnostic.permissionState === 'denied') {
+    headline = {
+      color: 'text-cortex-red border-cortex-red/40 bg-cortex-red/10',
+      text: 'Browser-level camera permission is DENIED. That is why no popup appears.',
+      tip: 'Click the lock icon (or "Not Secure") left of the URL → Camera → Allow → reload (Cmd+Shift+R) → click Enable Camera.',
+    };
+  } else if (diagnostic.permissionState === 'prompt' && status === 'idle') {
+    headline = {
+      color: 'text-cortex-accent border-cortex-accent/40 bg-cortex-accent/10',
+      text: 'Permission has never been asked. Click Enable Camera to trigger the browser popup.',
+      tip: 'A native permission dialog will appear from the browser.',
+    };
+  } else if (status === 'denied' || status === 'error_falling_back') {
+    headline = {
+      color: 'text-cortex-yellow border-cortex-yellow/40 bg-cortex-yellow/10',
+      text: errorMessage ?? 'Camera unavailable — using simulated metrics.',
+      tip: 'Open DevTools (Cmd+Opt+I) → Console for the full error chain.',
+    };
+  }
+
+  return (
+    <div className="rounded-md bg-cortex-bg/60 border border-cortex-border/60 p-2 text-[10px] font-mono space-y-1">
+      {headline && (
+        <div className={`rounded-md border px-2 py-1.5 ${headline.color}`}>
+          <div className="font-bold uppercase tracking-wider text-[10px]">{headline.text}</div>
+          <div className="text-[10px] mt-0.5 opacity-90 normal-case">{headline.tip}</div>
+        </div>
+      )}
+      <div className="grid grid-cols-2 gap-x-3 gap-y-0.5 text-cortex-dim">
+        <Diag label="origin" value={diagnostic.origin} />
+        <Diag label="secure ctx" value={diagnostic.secureContext ? 'yes' : 'NO'} bad={!diagnostic.secureContext} />
+        <Diag label="mediaDevices" value={diagnostic.mediaDevicesAvailable ? 'yes' : 'NO'} bad={!diagnostic.mediaDevicesAvailable} />
+        <Diag label="permission" value={diagnostic.permissionState} bad={diagnostic.permissionState === 'denied'} />
+        <Diag label="cameras seen" value={String(diagnostic.cameraDevices)} bad={diagnostic.cameraDevices === 0} />
+        <Diag label="status" value={status} />
+      </div>
+    </div>
+  );
+}
+
+function Diag({ label, value, bad }: { label: string; value: string; bad?: boolean }) {
+  return (
+    <div className="flex justify-between truncate">
+      <span className="text-cortex-dim">{label}</span>
+      <span className={bad ? 'text-cortex-red' : 'text-cortex-ink/90'} title={value}>
+        {value}
+      </span>
     </div>
   );
 }

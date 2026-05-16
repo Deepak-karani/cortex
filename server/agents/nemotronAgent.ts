@@ -53,27 +53,32 @@ interface ChatMessage {
 
 async function chatCompletion(
   messages: ChatMessage[],
-  options: { temperature?: number; maxTokens?: number } = {},
+  options: { temperature?: number; maxTokens?: number; jsonMode?: boolean } = {},
 ): Promise<string> {
   const { BASE_URL, API_KEY, MODEL, TIMEOUT_MS } = cfg();
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), TIMEOUT_MS);
   const url = `${BASE_URL.replace(/\/$/, '')}/chat/completions`;
   try {
+    const body: Record<string, unknown> = {
+      model: MODEL,
+      messages,
+      temperature: options.temperature ?? 0.4,
+      // Reasoning models burn tokens on internal "thinking" before the final
+      // answer. Give them plenty of room to think AND emit the JSON answer.
+      max_tokens: options.maxTokens ?? 4096,
+    };
+    if (options.jsonMode) {
+      // OpenAI-style JSON mode — Ollama also supports it via response_format.
+      body.response_format = { type: 'json_object' };
+    }
     const res = await fetch(url, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
         Authorization: `Bearer ${API_KEY}`,
       },
-      body: JSON.stringify({
-        model: MODEL,
-        messages,
-        temperature: options.temperature ?? 0.4,
-        // Reasoning models burn tokens on internal "thinking" before the final
-        // answer. Give them enough room to actually emit the answer.
-        max_tokens: options.maxTokens ?? 1200,
-      }),
+      body: JSON.stringify(body),
       signal: controller.signal,
     });
     if (!res.ok) {
@@ -98,6 +103,43 @@ async function chatCompletion(
     throw err;
   } finally {
     clearTimeout(timeout);
+  }
+}
+
+/**
+ * High-level helper for specialist agents: send a JSON-mode request, return a
+ * parsed object, throw on failure (so the caller can substitute a fallback).
+ */
+export async function callNemotronJson<T>(
+  systemPrompt: string,
+  userPayload: unknown,
+  options: { maxTokens?: number; temperature?: number; timeoutMs?: number } = {},
+): Promise<T> {
+  const original = process.env.NEMOTRON_TIMEOUT_MS;
+  if (options.timeoutMs) {
+    // Temporarily narrow the per-call timeout. cfg() reads env lazily.
+    process.env.NEMOTRON_TIMEOUT_MS = String(options.timeoutMs);
+  }
+  try {
+    const raw = await chatCompletion(
+      [
+        { role: 'system', content: systemPrompt },
+        { role: 'user', content: JSON.stringify(userPayload) },
+      ],
+      {
+        temperature: options.temperature ?? 0.3,
+        maxTokens: options.maxTokens ?? 1024,
+        jsonMode: true,
+      },
+    );
+    const parsed = safeJson<T | null>(raw, null);
+    if (!parsed) throw new Error('Nemotron returned unparseable JSON');
+    return parsed;
+  } finally {
+    if (options.timeoutMs) {
+      if (original === undefined) delete process.env.NEMOTRON_TIMEOUT_MS;
+      else process.env.NEMOTRON_TIMEOUT_MS = original;
+    }
   }
 }
 
@@ -185,43 +227,82 @@ function mockChooseIntervention(
   t: Telemetry,
   attn?: AttentionMetrics | null,
 ): { tools: ToolName[]; rationale: string } {
-  const attentionCollapse =
-    !!attn &&
-    (attn.offscreenRatio60s > 0.4 ||
-      attn.focusStability < 35 ||
-      attn.interpretedState === 'Overstimulated' ||
-      attn.interpretedState === 'Distracted');
+  // Per Face State Analyzer spec section 5 — each interpreted state has a
+  // defined intervention posture. Apply that first, then layer biometric load.
+  const interp = attn?.interpretedState ?? 'Unknown';
 
-  if (a.state === 'Green' && !attentionCollapse) {
+  // Focused: do not interrupt — but only honor this if biometrics agree.
+  if (interp === 'Focused' && a.state === 'Green') {
     return {
       tools: ['do_nothing'],
-      rationale: 'Load is within range and attention is steady. Intervention has a cost; skip this tick.',
+      rationale: 'Attention is focused and biometrics are Green. Do not interrupt the flow state.',
     };
   }
-  if (a.state === 'Green' && attentionCollapse) {
-    return {
-      tools: ['ask_socratic', 'open_relevant_doc'],
-      rationale:
-        'Biometrics are fine but webcam shows the user has drifted. Re-anchor with one question instead of an interrupt.',
-    };
-  }
-  if (a.state === 'Yellow' && !attentionCollapse) {
+  if (interp === 'Focused' && a.state === 'Yellow') {
     return {
       tools: ['recall_memory', 'simulate_futures'],
-      rationale: 'Yellow is a warning, not an emergency. Recall what worked before and project the futures before acting.',
+      rationale: 'Biometrics flag Yellow but attention reads Focused. Recall, simulate, and hold off on heavy tools.',
     };
   }
-  // Yellow + attention collapse, or Red, or Intervention.
+
+  // Distracted: ask one short re-anchor question.
+  if (interp === 'Distracted') {
+    const tools: ToolName[] = ['ask_socratic'];
+    if (a.state === 'Red') tools.push('mute_slack', 'enable_focus_mode');
+    return {
+      tools,
+      rationale: 'Attention is Distracted — surface one re-anchor question rather than piling on tools.',
+    };
+  }
+
+  // Fatigued: suggest a reset, Socratic question, or focus mode.
+  // Avoid dim_secondary_monitor — user is tired, not hyperfocused.
+  if (interp === 'Fatigued') {
+    return {
+      tools: ['ask_socratic', 'enable_focus_mode', 'block_calendar_time'],
+      rationale: 'Attention is Fatigued — protect calendar, surface one question, enable focus mode. Do not dim monitor.',
+    };
+  }
+
+  // Overstimulated: reduce notifications, simplify task queue.
+  if (interp === 'Overstimulated') {
+    return {
+      tools: ['mute_slack', 'close_tabs', 'enable_focus_mode', 'dim_secondary_monitor'],
+      rationale: 'Attention is Overstimulated — collapse the visual field: mute Slack, close tabs, focus mode, dim monitor.',
+    };
+  }
+
+  // Searching: offer help by surfacing the right doc; avoid heavy interruption.
+  if (interp === 'Searching') {
+    return {
+      tools: ['open_relevant_doc', 'recall_memory'],
+      rationale: 'Attention is Searching — surface the relevant doc and recall past patterns; do not interrupt heavily.',
+    };
+  }
+
+  // Unknown attention OR no attention signal — fall back to biometric-only logic.
+  if (a.state === 'Green') {
+    return {
+      tools: ['do_nothing'],
+      rationale: 'Biometric load is Green and attention signal is not available. Hold position.',
+    };
+  }
+  if (a.state === 'Yellow') {
+    return {
+      tools: ['recall_memory', 'simulate_futures'],
+      rationale: 'Yellow biometric load. Recall what worked before and project the futures before acting.',
+    };
+  }
+  // Red / Intervention without trustworthy attention.
   const toolset: ToolName[] = ['mute_slack', 'enable_focus_mode'];
   if (t.unreadNotifications > 20) toolset.push('close_tabs');
   if (t.deadlineMinutes < 20) toolset.push('block_calendar_time');
-  if (attn?.interpretedState !== 'Fatigued') toolset.push('dim_secondary_monitor');
-  if (attn?.interpretedState === 'Searching') toolset.push('open_relevant_doc');
+  toolset.push('dim_secondary_monitor');
   toolset.push('ask_socratic');
-  const reason = attentionCollapse
-    ? 'Attention collapse confirms the biometric story — fire a coordinated intervention bundle.'
-    : 'Red state with degrading biometrics — fire a coordinated intervention bundle.';
-  return { tools: toolset, rationale: reason };
+  return {
+    tools: toolset,
+    rationale: 'Red biometric load — fire a coordinated intervention bundle.',
+  };
 }
 
 const SOCRATIC_BANK = [
@@ -282,7 +363,7 @@ export async function analyzeCognitiveState(input: {
         { role: 'system', content: system },
         { role: 'user', content: user },
       ],
-      { temperature: 0.5, maxTokens: 220 },
+      { temperature: 0.5, maxTokens: 4096, jsonMode: true },
     );
     const parsed = safeJson<{ thought?: string }>(raw, {});
     if (!parsed.thought) throw new Error('missing thought');
@@ -316,7 +397,7 @@ export async function simulateFutureTimelines(input: {
         { role: 'system', content: system },
         { role: 'user', content: JSON.stringify(payload) },
       ],
-      { temperature: 0.5, maxTokens: 220 },
+      { temperature: 0.5, maxTokens: 4096, jsonMode: true },
     );
     const parsed = safeJson<{ noIntervention?: string; intervention?: string }>(raw, {});
     const enriched: FutureTimelines = {
@@ -351,7 +432,7 @@ export async function chooseIntervention(input: {
     .map(([name, desc]) => `- ${name}: ${desc}`)
     .join(
       '\n',
-    )}\n\nWebcam-derived attention metrics are provided. Use them: if interpretedState is Fatigued, avoid dim_secondary_monitor and prefer ask_socratic. If Searching, include open_relevant_doc. If Overstimulated or Distracted with high offscreenRatio, include mute_slack + enable_focus_mode. If attention looks Focused even at Yellow, lean toward observation rather than intervention.\n\nReturn JSON of the form {"tools": ["..."], "rationale": "one sentence on why"}. Pick 1-6 tools. Use "do_nothing" alone if state is Green AND attention is Focused.`;
+    )}\n\nWebcam-derived attention is provided. Follow this posture per interpretedState:\n- Focused: do NOT interrupt; prefer do_nothing or just observation.\n- Distracted: ask one short re-anchor question (ask_socratic); avoid heavy interruption.\n- Fatigued: suggest a short reset — ask_socratic, enable_focus_mode, block_calendar_time. Do NOT pick dim_secondary_monitor (user is tired, not hyperfocused).\n- Overstimulated: reduce notifications — mute_slack, close_tabs, enable_focus_mode, dim_secondary_monitor.\n- Searching: offer help via open_relevant_doc and recall_memory; do not interrupt heavily.\n- Unknown: fall back to biometric-only reasoning.\n\nReturn JSON of the form {"tools": ["..."], "rationale": "one sentence on why"}. Pick 1-6 tools. Use "do_nothing" alone if biometric state is Green AND attention is Focused.`;
   const user = JSON.stringify({
     telemetry: input.telemetry,
     assessment: input.assessment,
@@ -364,7 +445,7 @@ export async function chooseIntervention(input: {
         { role: 'system', content: system },
         { role: 'user', content: user },
       ],
-      { temperature: 0.3, maxTokens: 300 },
+      { temperature: 0.3, maxTokens: 4096, jsonMode: true },
     );
     const parsed = safeJson<{ tools?: string[]; rationale?: string }>(raw, {});
     const allowed = new Set(Object.keys(TOOL_DESCRIPTIONS));
@@ -400,7 +481,7 @@ export async function generateSocraticQuestion(input: {
         { role: 'system', content: system },
         { role: 'user', content: user },
       ],
-      { temperature: 0.7, maxTokens: 200 },
+      { temperature: 0.7, maxTokens: 4096, jsonMode: true },
     );
     const parsed = safeJson<{ question?: string; rationale?: string }>(raw, {});
     if (!parsed.question || !parsed.rationale) throw new Error('missing fields');

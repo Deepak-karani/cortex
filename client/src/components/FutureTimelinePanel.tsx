@@ -52,7 +52,7 @@ export default function FutureTimelinePanel({ timelines, assessment }: Props) {
   const idle = !timelines || assessment?.state === 'Green';
 
   return (
-    <div className="panel flex-1 min-h-0 flex flex-col">
+    <div className="panel flex-shrink-0 flex flex-col">
       <div className="panel-header">
         <span>branching futures · 12s projection</span>
         <span className="text-cortex-accent">{idle ? 'idle' : 'simulating'}</span>

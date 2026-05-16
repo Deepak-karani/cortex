@@ -11,7 +11,7 @@ import { Server as SocketServer } from 'socket.io';
 
 import { SimulationEngine } from '../sim/simulationEngine';
 import { scoreCognitiveLoad } from '../sim/cognitiveModel';
-import { ReactAgent } from '../agents/reactLoop';
+import { Orchestrator } from '../agents/orchestrator';
 import {
   clearMemories,
   loadMemories,
@@ -24,13 +24,21 @@ import {
   getLatestAttention,
   setLatestAttention,
 } from '../tools/checkAttentionState';
+import {
+  clearLatestScreen,
+  getLatestScreen,
+  setLatestScreen,
+} from '../sim/screenStore';
 import type {
+  AgentReport,
   AgentTraceEntry,
   AttentionMetrics,
   CognitiveAssessment,
   CognitiveState,
   DemoSpeed,
   MemoryRecord,
+  ProductivityInsight,
+  ScreenSummary,
   Telemetry,
   ToolResult,
 } from './types';
@@ -48,7 +56,104 @@ const io = new SocketServer(server, {
 });
 
 const sim = new SimulationEngine();
-const agent = new ReactAgent();
+const orchestrator = new Orchestrator();
+
+// Sanitize and clamp attention metrics coming from the browser.
+// Returns null if the payload is unusable (so we never trust raw client data).
+function sanitizeAttention(input: unknown): AttentionMetrics | null {
+  if (!input || typeof input !== 'object') return null;
+  const m = input as Partial<AttentionMetrics>;
+  if (typeof m.attentionScore !== 'number') return null;
+  const allowedGaze: AttentionMetrics['gazeDirection'][] = [
+    'center',
+    'left',
+    'right',
+    'down',
+    'offscreen',
+  ];
+  const allowedPose: AttentionMetrics['headPose'][] = [
+    'centered',
+    'turned_left',
+    'turned_right',
+    'down',
+    'away',
+  ];
+  const allowedState: AttentionMetrics['interpretedState'][] = [
+    'Focused',
+    'Distracted',
+    'Fatigued',
+    'Searching',
+    'Overstimulated',
+    'Unknown',
+  ];
+  return {
+    timestamp: Date.now(),
+    attentionScore: Math.max(0, Math.min(100, Math.round(m.attentionScore))),
+    gazeDirection: allowedGaze.includes(m.gazeDirection as never) ? (m.gazeDirection as AttentionMetrics['gazeDirection']) : 'center',
+    headPose: allowedPose.includes(m.headPose as never) ? (m.headPose as AttentionMetrics['headPose']) : 'centered',
+    distractionDurationSeconds: Math.max(0, m.distractionDurationSeconds || 0),
+    offscreenRatio60s: Math.max(0, Math.min(1, m.offscreenRatio60s || 0)),
+    blinkRate: Math.max(0, m.blinkRate || 0),
+    focusStability: Math.max(0, Math.min(100, Math.round(m.focusStability || 0))),
+    gazeSwitchRate: Math.max(0, m.gazeSwitchRate || 0),
+    faceDetected: !!m.faceDetected,
+    confidence: Math.max(0, Math.min(1, Number((m.confidence ?? 0.5).toFixed(2)))),
+    interpretedState: allowedState.includes(m.interpretedState as never)
+      ? (m.interpretedState as AttentionMetrics['interpretedState'])
+      : 'Unknown',
+    source: m.source === 'simulated' ? 'simulated' : 'webcam',
+  };
+}
+
+// Sanitize screen-summary payload. Critically: we drop anything that looks
+// like raw OCR text — only short tokens are retained.
+function sanitizeScreen(input: unknown): ScreenSummary | null {
+  if (!input || typeof input !== 'object') return null;
+  const s = input as Partial<ScreenSummary>;
+  if (typeof s.activeApp !== 'string') return null;
+  const allowedFlow: ScreenSummary['workflowState'][] = [
+    'flow',
+    'searching',
+    'switching',
+    'debugging',
+    'communicating',
+    'idle',
+  ];
+  const tokens = Array.isArray(s.ocrTokens)
+    ? s.ocrTokens
+        .filter((t): t is string => typeof t === 'string')
+        .map((t) => t.trim().toLowerCase())
+        .filter((t) => t.length >= 2 && t.length <= 24)
+        .slice(0, 24)
+    : [];
+  return {
+    timestamp: Date.now(),
+    activeApp: s.activeApp.slice(0, 64),
+    activeTitle: (s.activeTitle ?? '').slice(0, 160),
+    windows: Array.isArray(s.windows)
+      ? s.windows
+          .filter((w) => w && typeof (w as { app?: unknown }).app === 'string')
+          .slice(0, 10)
+          .map((w) => ({
+            app: (w as { app: string }).app.slice(0, 48),
+            title: ((w as { title?: string }).title ?? '').slice(0, 80),
+            category: (w as { category?: string }).category ?? 'other',
+            active: !!(w as { active?: boolean }).active,
+          }))
+      : [],
+    tabCount: Math.max(0, Math.min(99, Math.round(s.tabCount ?? 0))),
+    textSampleHash: typeof s.textSampleHash === 'string' ? s.textSampleHash.slice(0, 16) : undefined,
+    ocrTokens: tokens,
+    inferredTask: (s.inferredTask ?? '').slice(0, 80),
+    inferredProject: (s.inferredProject ?? '').slice(0, 80),
+    inferredIntent: (s.inferredIntent ?? '').slice(0, 120),
+    workflowState: allowedFlow.includes(s.workflowState as never)
+      ? (s.workflowState as ScreenSummary['workflowState'])
+      : 'idle',
+    confidence: Math.max(0, Math.min(1, Number((s.confidence ?? 0.5).toFixed(2)))),
+    source: s.source === 'simulated' ? 'simulated' : 'capture',
+  };
+}
 
 // Track current state to gate agent runs.
 let lastAssessment: CognitiveAssessment | null = null;
@@ -59,10 +164,21 @@ let episodeInterventions: string[] = [];
 let lastAgentRunAt = 0;
 const AGENT_RUN_INTERVAL_MS = 4000;
 
-// Stream agent trace as it happens.
-agent.on('trace', (entry: AgentTraceEntry) => {
+// Stream agent trace + per-agent reports + productivity insights live.
+orchestrator.on('trace', (entry: AgentTraceEntry) => {
   io.emit('agent:trace', entry);
 });
+orchestrator.on('agent_report', (report: AgentReport) => {
+  io.emit('agent:report', report);
+});
+orchestrator.on('insight', (insight: ProductivityInsight) => {
+  io.emit('insight:new', insight);
+});
+
+// DGX compute telemetry — emit every 2s so the HUD pulse is always alive.
+setInterval(() => {
+  io.emit('compute:update', orchestrator.getComputeTelemetry());
+}, 2000);
 
 // Sim → cognitive scoring → broadcast.
 sim.on('telemetry', async (telemetry: Telemetry) => {
@@ -113,10 +229,10 @@ sim.on('telemetry', async (telemetry: Telemetry) => {
     now - lastAgentRunAt > AGENT_RUN_INTERVAL_MS &&
     (assessment.state !== 'Green' || now - lastAgentRunAt > AGENT_RUN_INTERVAL_MS * 3);
 
-  if (shouldRun && !agent.isBusy()) {
+  if (shouldRun && !orchestrator.isBusy()) {
     lastAgentRunAt = now;
     try {
-      const output = await agent.run({ telemetry, assessment });
+      const output = await orchestrator.run({ telemetry, assessment });
 
       // Track interventions for the episode record.
       for (const t of output.chosenTools) {
@@ -182,6 +298,7 @@ app.post('/demo/reset', async (_req, res) => {
   episodeStartTime = null;
   episodeInterventions = [];
   clearLatestAttention();
+  clearLatestScreen();
   io.emit('agent:trace:reset', { timestamp: Date.now() });
   res.json({ ok: true });
 });
@@ -205,21 +322,60 @@ app.post('/demo/manual-state', (req, res) => {
   res.json({ ok: true, state });
 });
 
+// Face State Analyzer REST endpoint — spec section 4.
+// Browser-side pipeline can use the socket OR this POST. Either way, only
+// summarized metrics are accepted. Raw frames are never received here.
+// Screen Understanding REST endpoint.
+app.post('/api/screen-state', (req, res) => {
+  const sanitized = sanitizeScreen(req.body);
+  if (!sanitized) {
+    return res.status(400).json({ ok: false, error: 'invalid screen payload' });
+  }
+  setLatestScreen(sanitized);
+  io.emit('screen:update', sanitized);
+  return res.json({ ok: true, screen: sanitized });
+});
+
+app.get('/api/screen-state', (_req, res) => {
+  res.json({ ok: true, screen: getLatestScreen() });
+});
+
+app.get('/api/compute', (_req, res) => {
+  res.json({ ok: true, telemetry: orchestrator.getComputeTelemetry() });
+});
+
+app.post('/api/attention-state', (req, res) => {
+  const sanitized = sanitizeAttention(req.body);
+  if (!sanitized) {
+    return res.status(400).json({ ok: false, error: 'invalid attention payload' });
+  }
+  setLatestAttention(sanitized);
+  io.emit('attention:update', sanitized);
+  return res.json({ ok: true, attention: sanitized });
+});
+
+app.get('/api/attention-state', (_req, res) => {
+  res.json({ ok: true, attention: getLatestAttention() });
+});
+
 app.post('/agent/run', async (_req, res) => {
   if (!lastTelemetry || !lastAssessment) {
     return res.status(409).json({ ok: false, error: 'simulation not started' });
   }
-  const output = await agent.run({ telemetry: lastTelemetry, assessment: lastAssessment });
+  const output = await orchestrator.run({ telemetry: lastTelemetry, assessment: lastAssessment });
   if (output.timelines) io.emit('timeline:update', output.timelines);
   for (const tr of output.toolResults) io.emit('action:log', tr);
   if (output.socratic) io.emit('socratic:update', output.socratic);
   io.emit('fallback:update', output.fallback);
+  io.emit('compute:update', orchestrator.getComputeTelemetry());
   res.json({
     ok: true,
     trace: output.trace,
     toolResults: output.toolResults,
     chosenTools: output.chosenTools,
     fallback: output.fallback,
+    reports: output.reports,
+    insights: output.insights,
   });
 });
 
@@ -235,6 +391,9 @@ io.on('connection', async (socket) => {
   socket.emit('memory:update', await loadMemories());
   const attentionSnapshot = getLatestAttention();
   if (attentionSnapshot) socket.emit('attention:update', attentionSnapshot);
+  const screenSnapshot = getLatestScreen();
+  if (screenSnapshot) socket.emit('screen:update', screenSnapshot);
+  socket.emit('compute:update', orchestrator.getComputeTelemetry());
 
   socket.on('demo:start', () => sim.start());
   socket.on('demo:reset', () => sim.reset());
@@ -245,23 +404,16 @@ io.on('connection', async (socket) => {
     sim.setManualState(payload.state ?? null);
   });
   socket.on('attention:push', (metrics: AttentionMetrics) => {
-    if (!metrics || typeof metrics.attentionScore !== 'number') return;
-    // Store summarized metrics only — never any frame data.
-    const sanitized: AttentionMetrics = {
-      timestamp: Date.now(),
-      attentionScore: Math.max(0, Math.min(100, Math.round(metrics.attentionScore))),
-      gazeDirection: metrics.gazeDirection,
-      distractionDurationSeconds: Math.max(0, metrics.distractionDurationSeconds || 0),
-      offscreenRatio60s: Math.max(0, Math.min(1, metrics.offscreenRatio60s || 0)),
-      blinkRate: Math.max(0, metrics.blinkRate || 0),
-      focusStability: Math.max(0, Math.min(100, Math.round(metrics.focusStability))),
-      gazeSwitchRate: Math.max(0, metrics.gazeSwitchRate || 0),
-      faceDetected: !!metrics.faceDetected,
-      interpretedState: metrics.interpretedState,
-      source: metrics.source === 'simulated' ? 'simulated' : 'webcam',
-    };
+    const sanitized = sanitizeAttention(metrics);
+    if (!sanitized) return;
     setLatestAttention(sanitized);
     socket.broadcast.emit('attention:update', sanitized);
+  });
+  socket.on('screen:push', (summary: ScreenSummary) => {
+    const sanitized = sanitizeScreen(summary);
+    if (!sanitized) return;
+    setLatestScreen(sanitized);
+    socket.broadcast.emit('screen:update', sanitized);
   });
 
   socket.on('disconnect', () => {

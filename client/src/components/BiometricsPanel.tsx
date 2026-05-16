@@ -34,7 +34,7 @@ export default function BiometricsPanel({ telemetry, assessment }: Props) {
       : '#3ee892';
 
   return (
-    <div className="panel flex-1 min-h-0 flex flex-col">
+    <div className="panel flex-shrink-0 flex flex-col">
       <div className="panel-header">
         <span>biometrics · apple watch sim</span>
         <span className="text-cortex-accent">{assessment?.state ?? '—'}</span>

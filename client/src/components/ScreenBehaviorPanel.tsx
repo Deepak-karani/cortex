@@ -6,7 +6,7 @@ interface Props {
 
 export default function ScreenBehaviorPanel({ telemetry }: Props) {
   return (
-    <div className="panel flex-1 min-h-0 flex flex-col">
+    <div className="panel flex-shrink-0 flex flex-col">
       <div className="panel-header">
         <span>screen behavior · macOS sim</span>
         <span className="text-cortex-accent">live</span>

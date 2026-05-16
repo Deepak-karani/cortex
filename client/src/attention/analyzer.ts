@@ -1,4 +1,9 @@
-import type { AttentionInterpretedState, AttentionMetrics, GazeDirection } from '../types';
+import type {
+  AttentionInterpretedState,
+  AttentionMetrics,
+  GazeDirection,
+  HeadPose,
+} from '../types';
 import { LANDMARKS, dist, type NormalizedLandmark } from './landmarks';
 
 const HISTORY_WINDOW_MS = 60_000;
@@ -31,6 +36,8 @@ export class AttentionAnalyzer {
   private offscreenStartAt: number | null = null;
   private lastTickAt = Date.now();
   private stabilityEma = 80; // exponential moving average
+  private lastHeadPose: HeadPose = 'centered';
+  private lastConfidence = 0;
 
   /**
    * Build metrics directly from one frame of FaceMesh landmarks.
@@ -44,6 +51,8 @@ export class AttentionAnalyzer {
       // Face not detected — treat as offscreen sample.
       this.pushGaze('offscreen', true, now);
       if (this.offscreenStartAt === null) this.offscreenStartAt = now;
+      this.lastHeadPose = 'away';
+      this.lastConfidence = 0;
       const metrics = this.buildMetrics(now, false);
       return { metrics, heat: null, rawGazeX: 0, rawGazeY: 0 };
     }
@@ -97,12 +106,40 @@ export class AttentionAnalyzer {
     );
     const gazeY = (leftGazeY + rightGazeY) / 2;
 
-    // ---- Head pose (yaw approximation) ----
+    // ---- Head pose (yaw + pitch approximation) ----
     const noseTip = landmarks[LANDMARKS.NOSE_TIP];
+    const chin = landmarks[LANDMARKS.CHIN];
+    const forehead = landmarks[LANDMARKS.FOREHEAD];
     const leftCheek = landmarks[LANDMARKS.LEFT_CHEEK];
     const rightCheek = landmarks[LANDMARKS.RIGHT_CHEEK];
     const faceWidth = dist(leftCheek, rightCheek) || 0.0001;
+    const faceHeight = dist(forehead, chin) || 0.0001;
     const headYaw = (noseTip.x - (leftCheek.x + rightCheek.x) / 2) / faceWidth; // -0.5..0.5
+    const headPitch = (noseTip.y - (forehead.y + chin.y) / 2) / faceHeight; // -0.5..0.5
+
+    // Classify head pose as an enum the spec asks for.
+    let headPose: HeadPose;
+    if (faceWidth < 0.05) {
+      // Face very small in frame → likely far away or out of frame.
+      headPose = 'away';
+    } else if (headPitch > 0.12) {
+      headPose = 'down';
+    } else if (headYaw > 0.18) {
+      headPose = 'turned_left';
+    } else if (headYaw < -0.18) {
+      headPose = 'turned_right';
+    } else {
+      headPose = 'centered';
+    }
+    this.lastHeadPose = headPose;
+
+    // Confidence: how trustworthy is this frame's reading?
+    // High when face is big, well-centered, eyes open.
+    // Low when face is tiny, extremely off-axis, or eyes closed.
+    const sizeScore = Math.min(1, faceWidth / 0.2); // ideal ~0.2 of frame width
+    const eyesOpenScore = eyesClosed ? 0.4 : 1;
+    const poseScore = headPose === 'centered' ? 1 : headPose === 'away' ? 0.3 : 0.75;
+    this.lastConfidence = clamp(sizeScore * 0.5 + eyesOpenScore * 0.25 + poseScore * 0.25, 0, 1);
 
     // Blend gaze and head pose to decide direction.
     const combinedX = gazeX * 0.65 + headYaw * 4 * 0.35;
@@ -194,6 +231,17 @@ export class AttentionAnalyzer {
     const targetStability = Math.max(0, 100 - recentSwitches * 12);
     this.stabilityEma = this.stabilityEma * 0.85 + targetStability * 0.15;
 
+    // Simulator: synthesize head pose and confidence from bias too.
+    this.lastHeadPose =
+      direction === 'down'
+        ? 'down'
+        : direction === 'left'
+        ? 'turned_left'
+        : direction === 'right'
+        ? 'turned_right'
+        : 'centered';
+    this.lastConfidence = bias === 'tired' ? 0.7 : bias === 'drifting' ? 0.65 : 0.85;
+
     const heat = {
       x: direction === 'left' ? 0.2 : direction === 'right' ? 0.8 : direction === 'down' ? 0.5 : 0.5,
       y: direction === 'down' ? 0.85 : 0.45,
@@ -261,18 +309,21 @@ export class AttentionAnalyzer {
       blinkRate,
       faceDetected,
       distractionDurationSeconds,
+      confidence: this.lastConfidence,
     });
 
     return {
       timestamp: now,
       attentionScore,
       gazeDirection: this.lastDirection,
+      headPose: this.lastHeadPose,
       distractionDurationSeconds,
       offscreenRatio60s,
       blinkRate,
       focusStability,
       gazeSwitchRate: switchesPerMin,
       faceDetected,
+      confidence: Number(this.lastConfidence.toFixed(2)),
       interpretedState,
       source: 'webcam',
     };
@@ -335,7 +386,13 @@ function interpret(input: {
   blinkRate: number;
   faceDetected: boolean;
   distractionDurationSeconds: number;
+  confidence: number;
 }): AttentionInterpretedState {
+  // Unknown when we cannot trust the reading: no face, very low confidence,
+  // or insufficient signal accumulated yet.
+  if (!input.faceDetected) return 'Unknown';
+  if (input.confidence < 0.35) return 'Unknown';
+
   if (input.distractionDurationSeconds > 5 || input.offscreenRatio60s > 0.45) {
     return 'Distracted';
   }

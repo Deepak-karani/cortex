@@ -23,6 +23,16 @@ export interface UseAttentionResult {
   fps: number;
   source: 'webcam' | 'simulated' | null;
   streamActive: boolean;
+  diagnostic: AttentionDiagnostic;
+}
+
+export interface AttentionDiagnostic {
+  secureContext: boolean;
+  mediaDevicesAvailable: boolean;
+  permissionState: 'granted' | 'denied' | 'prompt' | 'unknown';
+  origin: string;
+  userAgent: string;
+  cameraDevices: number;
 }
 
 const HEAT_MAX = 80;
@@ -51,6 +61,51 @@ export function useAttentionTracking(
   const [fps, setFps] = useState(0);
   const [source, setSource] = useState<'webcam' | 'simulated' | null>(null);
   const [streamActive, setStreamActive] = useState(false);
+  const [diagnostic, setDiagnostic] = useState<AttentionDiagnostic>(() => ({
+    secureContext: typeof window !== 'undefined' ? window.isSecureContext : false,
+    mediaDevicesAvailable:
+      typeof navigator !== 'undefined' && !!navigator.mediaDevices?.getUserMedia,
+    permissionState: 'unknown',
+    origin: typeof window !== 'undefined' ? window.location.origin : '',
+    userAgent: typeof navigator !== 'undefined' ? navigator.userAgent : '',
+    cameraDevices: 0,
+  }));
+
+  // Probe the OS-level camera permission state once, and re-probe after any
+  // permission change. This is the only honest answer to "is the OS blocking?"
+  useEffect(() => {
+    let cancelled = false;
+    const refresh = async () => {
+      let permState: AttentionDiagnostic['permissionState'] = 'unknown';
+      try {
+        const result = await (navigator.permissions as Permissions | undefined)?.query?.({
+          name: 'camera' as PermissionName,
+        });
+        if (result) {
+          permState = result.state as AttentionDiagnostic['permissionState'];
+          result.onchange = () => {
+            if (!cancelled) setDiagnostic((d) => ({ ...d, permissionState: result.state as AttentionDiagnostic['permissionState'] }));
+          };
+        }
+      } catch {
+        // Not all browsers support Permissions API for camera.
+      }
+      let cameraCount = 0;
+      try {
+        const devs = await navigator.mediaDevices?.enumerateDevices?.();
+        cameraCount = devs ? devs.filter((d) => d.kind === 'videoinput').length : 0;
+      } catch {
+        // ignore
+      }
+      if (!cancelled) {
+        setDiagnostic((d) => ({ ...d, permissionState: permState, cameraDevices: cameraCount }));
+      }
+    };
+    void refresh();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   const setStatusBoth = useCallback((s: WebcamStatus) => {
     statusRef.current = s;
@@ -136,17 +191,32 @@ export function useAttentionTracking(
   const start = useCallback(async () => {
     const current = statusRef.current;
     log('start() called, current status =', current);
-    if (current === 'running' || current === 'requesting' || current === 'loading_model') {
-      log('already in progress; ignoring');
+    // Only ignore re-clicks while actively running. If a previous attempt got
+    // stuck in 'requesting' or 'loading_model' (e.g. MediaPipe CDN hiccup),
+    // the user should be able to retry — so we tear it down and start over.
+    if (current === 'running') {
+      log('already running; ignoring');
       return;
     }
+    log('hard-resetting any prior state');
     setErrorMessage(null);
 
-    // Stop any running simulation before requesting webcam.
+    // Hard-stop everything from any prior attempt: simulation, RAF loop,
+    // stream, model. We want a clean slate before requesting the camera.
     if (simTimerRef.current) {
       window.clearInterval(simTimerRef.current);
       simTimerRef.current = null;
     }
+    if (rafRef.current) {
+      cancelAnimationFrame(rafRef.current);
+      rafRef.current = null;
+    }
+    if (streamRef.current) {
+      streamRef.current.getTracks().forEach((t) => t.stop());
+      streamRef.current = null;
+    }
+    if (videoRef.current) videoRef.current.srcObject = null;
+    setStreamActive(false);
 
     if (typeof navigator === 'undefined' || !navigator.mediaDevices?.getUserMedia) {
       setStatusBoth('unsupported');
@@ -202,8 +272,15 @@ export function useAttentionTracking(
     setStatusBoth('loading_model');
     let lm;
     try {
-      log('loading FaceMesh model...');
-      lm = await loadFaceLandmarker();
+      log('loading FaceMesh model (downloads ~13MB on first run)...');
+      // 30s timeout — first-time WASM+model download from MediaPipe CDN can
+      // take a while on slow networks. If it hangs forever, fall back.
+      lm = await Promise.race([
+        loadFaceLandmarker(),
+        new Promise<never>((_, reject) =>
+          setTimeout(() => reject(new Error('FaceMesh load timed out after 30s')), 30000),
+        ),
+      ]);
       log('FaceMesh model ready');
     } catch (err) {
       const msg = (err as Error).message ?? 'unknown error';
@@ -282,7 +359,8 @@ export function useAttentionTracking(
       fps,
       source,
       streamActive,
+      diagnostic,
     }),
-    [errorMessage, fps, heat, metrics, source, start, status, stop, streamActive],
+    [errorMessage, fps, heat, metrics, source, start, status, stop, streamActive, diagnostic],
   );
 }

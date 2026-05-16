@@ -19,7 +19,7 @@ const TOOL_GLYPH: Record<string, string> = {
 
 export default function ActionLogPanel({ actions }: Props) {
   return (
-    <div className="panel flex-1 min-h-0 flex flex-col">
+    <div className="panel flex-shrink-0 flex flex-col" style={{ minHeight: '20rem', maxHeight: '32rem' }}>
       <div className="panel-header">
         <span>action log · tool executions</span>
         <span className="text-cortex-accent">{actions.length}</span>

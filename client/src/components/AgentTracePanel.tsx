@@ -50,7 +50,7 @@ export default function AgentTracePanel({ trace }: Props) {
   }, [trace]);
 
   return (
-    <div className="panel flex-1 min-h-0 flex flex-col">
+    <div className="panel flex-shrink-0 flex flex-col" style={{ minHeight: '20rem', maxHeight: '32rem' }}>
       <div className="panel-header">
         <span>agent trace · nemotron react loop</span>
         <span className="text-cortex-accent">{trace.length} steps</span>

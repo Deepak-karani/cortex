@@ -23,27 +23,34 @@ function summarize(m: AttentionMetrics): string {
   const parts: string[] = [];
   parts.push(`interpreted=${m.interpretedState}`);
   parts.push(`gaze=${m.gazeDirection}`);
-  parts.push(`offscreen ${offPct}% of last 60s`);
+  parts.push(`headPose=${m.headPose}`);
+  parts.push(`offscreen=${offPct}% last 60s`);
   parts.push(`stability=${m.focusStability}`);
-  parts.push(`blink rate=${m.blinkRate.toFixed(1)}/min`);
-  parts.push(`distracted for ${m.distractionDurationSeconds.toFixed(1)}s`);
+  parts.push(`blinkRate=${m.blinkRate.toFixed(1)}/min`);
+  if (m.distractionDurationSeconds > 1) {
+    parts.push(`distracted ${m.distractionDurationSeconds.toFixed(1)}s`);
+  }
+  parts.push(`confidence=${m.confidence.toFixed(2)}`);
   if (!m.faceDetected) parts.push('face not detected');
-  if (m.source === 'simulated') parts.push('source=simulated (webcam unavailable)');
+  if (m.source === 'simulated') parts.push('source=simulated');
   return parts.join(' · ');
 }
 
 function expectedBenefit(m: AttentionMetrics): string {
+  // Per spec section 5: each state maps to a specific intervention posture.
   switch (m.interpretedState) {
     case 'Focused':
-      return 'Confirms low intervention need; agent can hold position.';
+      return 'Do not interrupt. User is in flow.';
     case 'Distracted':
-      return 'Provides hard evidence to justify muting interrupts and engaging focus mode.';
+      return 'Ask one short re-anchor question; avoid heavy interruption.';
     case 'Fatigued':
-      return 'Justifies suggesting a short reset instead of more tools.';
+      return 'Suggest a short reset or Socratic question. Avoid dimming the monitor — user is tired, not hyperfocused.';
     case 'Searching':
-      return 'Justifies surfacing the current task or relevant doc, not adding load.';
+      return 'Offer help by surfacing the relevant doc, but do not pile on more tools.';
     case 'Overstimulated':
-      return 'Justifies a coordinated intervention bundle to collapse visual field.';
+      return 'Reduce notifications, mute Slack, and simplify the task queue.';
+    case 'Unknown':
+      return 'Attention signal is not trustworthy right now. Treat as biometrics-only.';
   }
 }
 
