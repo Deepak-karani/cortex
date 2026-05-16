@@ -19,6 +19,7 @@ import {
   saveMemory,
 } from '../memory/memoryStore';
 import { getFallbackStatus } from '../agents/nemotronAgent';
+import { getRuntimeHealth, probeRuntime, startRuntimeHealthLoop } from '../agents/openclawRuntime';
 import {
   clearLatestAttention,
   getLatestAttention,
@@ -178,6 +179,7 @@ orchestrator.on('insight', (insight: ProductivityInsight) => {
 // DGX compute telemetry — emit every 2s so the HUD pulse is always alive.
 setInterval(() => {
   io.emit('compute:update', orchestrator.getComputeTelemetry());
+  io.emit('runtime:update', getRuntimeHealth());
 }, 2000);
 
 // Sim → cognitive scoring → broadcast.
@@ -274,6 +276,11 @@ app.get('/health', (_req, res) => {
     simRunning: sim.isRunning(),
     speed: sim.getSpeed(),
   });
+});
+
+app.get('/api/runtime', async (req, res) => {
+  if (req.query.refresh === '1') await probeRuntime();
+  res.json({ ok: true, runtime: getRuntimeHealth() });
 });
 
 app.get('/memory', async (_req, res) => {
@@ -422,6 +429,7 @@ io.on('connection', async (socket) => {
 });
 
 const PORT_TO_USE = PORT;
+startRuntimeHealthLoop(15_000);
 server.listen(PORT_TO_USE, () => {
   console.log(`Cortex Arena server running on http://localhost:${PORT_TO_USE}`);
   console.log(`Allowed client origin: ${CLIENT_ORIGIN}`);

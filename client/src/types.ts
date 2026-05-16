@@ -201,3 +201,16 @@ export interface ComputeTelemetry {
   device: string;
   model: string;
 }
+
+export interface RuntimeHealth {
+  ok: boolean;
+  reachable: boolean;
+  baseUrl: string;
+  servedModel: string | null;
+  configuredModel: string;
+  latencyMs: number | null;
+  fallbackActive: boolean;
+  fallbackReason: string;
+  lastCheckedAt: number;
+  notes: string[];
+}

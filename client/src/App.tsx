@@ -1,146 +1,266 @@
-import { useCallback, useState } from 'react';
-import { useCortexSocket } from './hooks/useCortexSocket';
+import { useCallback, useEffect } from 'react';
 import { useAttentionTracking } from './hooks/useAttentionTracking';
 import { useScreenUnderstanding } from './hooks/useScreenUnderstanding';
 import { useRoute } from './hooks/useRoute';
+import { useCortexStore } from './store/useCortexStore';
 import { AdminPage } from './AdminPage';
-import { HudFrame } from './hud/HudFrame';
-import { CognitiveCore } from './hud/CognitiveCore';
-import { AgentConstellation } from './hud/AgentConstellation';
-import { ReasoningStream } from './hud/ReasoningStream';
-import { InsightStack } from './hud/InsightStack';
-import { ScreenUnderstanding } from './hud/ScreenUnderstanding';
-import { AttentionTile } from './hud/AttentionTile';
-import { BiometricsTile } from './hud/BiometricsTile';
-import { InterventionQueue } from './hud/InterventionQueue';
-import { SocraticTile } from './hud/SocraticTile';
-import { QuickActions } from './hud/QuickActions';
+import { DashboardShell } from './components/dashboard/DashboardShell';
+import { HeroStatusCard } from './components/dashboard/HeroStatusCard';
+import { HeartRateCard } from './components/dashboard/HeartRateCard';
+import { WebcamCard } from './components/dashboard/WebcamCard';
+import { ScreenCard } from './components/dashboard/ScreenCard';
+import { DGXStatusCard } from './components/dashboard/DGXStatusCard';
+import { CurrentTaskCard } from './components/dashboard/CurrentTaskCard';
+import { ReasoningSummary } from './components/dashboard/ReasoningSummary';
+import { TimelinePanel } from './components/dashboard/TimelinePanel';
+import { PrivacyPanel } from './components/dashboard/PrivacyPanel';
+import { OnboardingBar } from './components/dashboard/OnboardingBar';
 import type { AttentionMetrics, ScreenSummary } from './types';
 
 export default function App() {
-  const cortex = useCortexSocket();
   const [route, navigate] = useRoute();
-  const [simRunning, setSimRunning] = useState(false);
 
-  const handleAttention = useCallback((m: AttentionMetrics) => cortex.pushAttention(m), [cortex]);
-  const handleScreen = useCallback((s: ScreenSummary) => cortex.pushScreen(s), [cortex]);
+  // Boot the unified socket + heart-rate adapter exactly once.
+  const initStore = useCortexStore((s) => s._init);
+  useEffect(() => initStore(), [initStore]);
+
+  const pushAttention = useCortexStore((s) => s.pushAttentionToServer);
+  const pushScreen = useCortexStore((s) => s.pushScreenToServer);
+  const setWebcamEnabled = useCortexStore((s) => s.setWebcamEnabled);
+  const setScreenEnabled = useCortexStore((s) => s.setScreenEnabled);
+  const startDemo = useCortexStore((s) => s.startDemo);
+  const startFocusSprint = useCortexStore((s) => s.startFocusSprint);
+
+  const handleAttention = useCallback((m: AttentionMetrics) => pushAttention(m), [pushAttention]);
+  const handleScreen = useCallback((s: ScreenSummary) => pushScreen(s), [pushScreen]);
 
   const attention = useAttentionTracking(handleAttention);
   const screen = useScreenUnderstanding(handleScreen);
 
-  const startDemo = useCallback(() => {
-    cortex.startDemo();
-    setSimRunning(true);
-  }, [cortex]);
-  const resetDemo = useCallback(() => {
-    cortex.resetDemo();
-    setSimRunning(false);
-  }, [cortex]);
+  // Mirror sub-hook lifecycle into the store so the UI's status pills update.
+  useEffect(() => {
+    setWebcamEnabled(attention.status === 'running' || attention.status === 'error_falling_back');
+  }, [attention.status, setWebcamEnabled]);
+  useEffect(() => {
+    setScreenEnabled(screen.status.kind === 'running');
+  }, [screen.status, setScreenEnabled]);
 
-  const cameraRunning = attention.status === 'running';
-  const screenRunning = screen.status.kind === 'running';
+  const enableCamera = useCallback(() => void attention.start(), [attention]);
+  const shareScreen = useCallback(() => {
+    void screen.start();
+  }, [screen]);
+  const startSimulatedScreen = useCallback(() => screen.startSimulated(), [screen]);
 
-  const toggleCamera = useCallback(() => {
-    if (cameraRunning) attention.stop();
-    else void attention.start();
-  }, [attention, cameraRunning]);
+  const onStartFocusSprint = useCallback(() => {
+    startFocusSprint();
+  }, [startFocusSprint]);
 
-  const toggleScreen = useCallback(() => {
-    if (screenRunning) screen.stop();
-    else void screen.start();
-  }, [screen, screenRunning]);
+  const onViewReasoning = useCallback(() => {
+    // Scrolls to the reasoning panel.
+    document.getElementById('cortex-reasoning')?.scrollIntoView({ behavior: 'smooth', block: 'center' });
+  }, []);
 
   if (route === 'admin') {
     return (
-      <AdminPage
-        compute={cortex.compute}
-        fallback={cortex.fallback}
-        assessment={cortex.assessment}
-        telemetry={cortex.telemetry}
-        attention={attention.metrics ?? cortex.remoteAttention}
-        attentionDiagnostic={attention.diagnostic}
+      <AdminPageAdapter
         attentionStatus={attention.status}
-        screen={screen.summary ?? cortex.remoteScreen}
+        attentionDiagnostic={attention.diagnostic}
         screenStatus={screen.status}
-        memory={cortex.memory}
-        reports={cortex.reports}
-        onStartDemo={startDemo}
-        onResetDemo={resetDemo}
-        onSetSpeed={cortex.setSpeed}
-        onManualState={cortex.setManualState}
-        onClearMemory={cortex.clearMemory}
-        onRunAgent={cortex.runAgent}
         onBack={() => navigate('main')}
       />
     );
   }
 
   return (
-    <div className="h-full w-full flex flex-col bg-cortex-bg text-cortex-ink overflow-hidden">
-      <HudFrame
-        connected={cortex.connected}
-        assessment={cortex.assessment}
-        fallback={cortex.fallback}
-        attention={attention.metrics ?? cortex.remoteAttention}
-        screen={screen.summary ?? cortex.remoteScreen}
-        compute={cortex.compute}
-        rightSlot={
-          <QuickActions
-            simRunning={simRunning}
-            cameraRunning={cameraRunning}
-            screenRunning={screenRunning}
-            onStartDemo={startDemo}
-            onStopDemo={resetDemo}
-            onToggleCamera={toggleCamera}
-            onToggleScreen={toggleScreen}
-            onOpenAdmin={() => navigate('admin')}
-          />
-        }
-      />
+    <DashboardShell onOpenAdmin={() => navigate('admin')}>
+      <div className="flex flex-col gap-5">
+        <OnboardingBar
+          cameraReady={attention.status === 'running'}
+          screenReady={screen.status.kind === 'running' || screen.source === 'simulated'}
+          onStartDemo={startDemo}
+          onEnableCamera={enableCamera}
+          onShareScreen={shareScreen}
+          onStartSimulatedScreen={startSimulatedScreen}
+        />
 
-      <main className="flex-1 grid grid-cols-12 gap-3 p-3 min-h-0 overflow-hidden">
-        {/* LEFT: vital signs + face state */}
-        <section className="col-span-3 flex flex-col gap-3 min-h-0 overflow-y-auto scrollbar-thin pr-1">
-          <BiometricsTile telemetry={cortex.telemetry} assessment={cortex.assessment} />
-          <AttentionTile
+        <HeroStatusCard onStartFocusSprint={onStartFocusSprint} onViewReasoning={onViewReasoning} />
+
+        <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4">
+          <HeartRateCard />
+          <WebcamCard
             videoRef={attention.videoRef}
-            metrics={attention.metrics}
             status={attention.status}
-            errorMessage={attention.errorMessage}
-            heat={attention.heat}
-            fps={attention.fps}
-            source={attention.source}
-            streamActive={attention.streamActive}
             diagnostic={attention.diagnostic}
-            onStart={() => void attention.start()}
+            streamActive={attention.streamActive}
+            errorMessage={attention.errorMessage}
+            onStart={enableCamera}
             onStop={attention.stop}
-            compact
           />
-        </section>
-
-        {/* CENTER: cognitive core + screen + agent constellation + socratic */}
-        <section className="col-span-6 flex flex-col gap-3 min-h-0 overflow-y-auto scrollbar-thin pr-1">
-          <CognitiveCore assessment={cortex.assessment} telemetry={cortex.telemetry} />
-          <ScreenUnderstanding
-            summary={screen.summary ?? cortex.remoteScreen}
+          <ScreenCard
             status={screen.status}
-            source={screen.source}
-            onStartCapture={screen.start}
-            onStartSimulated={screen.startSimulated}
+            onShareScreen={async () => {
+              await screen.start();
+            }}
+            onStartSimulated={startSimulatedScreen}
             onStop={screen.stop}
-            compact
           />
-          <AgentConstellation reports={cortex.reports} />
-          <SocraticTile socratic={cortex.socratic} assessment={cortex.assessment} />
-        </section>
+          <DGXStatusCard />
+        </div>
 
-        {/* RIGHT: reasoning stream + insights + interventions */}
-        <section className="col-span-3 flex flex-col gap-3 min-h-0 overflow-y-auto scrollbar-thin pr-1">
-          <ReasoningStream trace={cortex.trace} />
-          <InsightStack insights={cortex.insights} />
-          <InterventionQueue actions={cortex.actions} />
-        </section>
-      </main>
-    </div>
+        <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
+          <div className="lg:col-span-1">
+            <CurrentTaskCard />
+          </div>
+          <div className="lg:col-span-2" id="cortex-reasoning">
+            <ReasoningSummary />
+          </div>
+        </div>
+
+        <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
+          <div className="lg:col-span-2">
+            <TimelinePanel />
+          </div>
+          <div className="lg:col-span-1">
+            <PrivacyPanel
+              webcamEnabled={attention.status === 'running'}
+              screenEnabled={screen.status.kind === 'running'}
+              onToggleWebcam={() => (attention.status === 'running' ? attention.stop() : void attention.start())}
+              onToggleScreen={() => (screen.status.kind === 'running' ? screen.stop() : void screen.start())}
+            />
+          </div>
+        </div>
+      </div>
+    </DashboardShell>
+  );
+}
+
+// Adapter so the existing AdminPage keeps working with the new store.
+function AdminPageAdapter({
+  attentionStatus,
+  attentionDiagnostic,
+  screenStatus,
+  onBack,
+}: {
+  attentionStatus: string;
+  attentionDiagnostic: ReturnType<typeof useAttentionTracking>['diagnostic'];
+  screenStatus: ReturnType<typeof useScreenUnderstanding>['status'];
+  onBack: () => void;
+}) {
+  const compute = useCortexStore((s) => ({
+    timestamp: Date.now(),
+    agentRunsLast60s: 0,
+    toolCallsLast60s: 0,
+    nemotronCallsLast60s: 0,
+    avgLatencyMs: s.system.latencyMs,
+    fallbackRatio: s.system.fallbackActive ? 1 : 0,
+    inflight: 0,
+    device: s.system.device,
+    model: s.system.nemotronModel,
+  }));
+  const fallback = useCortexStore((s) => ({
+    active: s.system.fallbackActive,
+    reason: s.system.fallbackReason,
+    lastChecked: Date.now(),
+  }));
+  const assessment = useCortexStore((s) =>
+    s.cognitive.rawState
+      ? {
+          timestamp: Date.now(),
+          cognitiveLoadScore: s.cognitive.loadScore,
+          state: s.cognitive.rawState,
+          explanation: s.cognitive.explanation,
+        }
+      : null,
+  );
+  const telemetry = useCortexStore((s) => s.telemetry);
+  const webcamMetrics = useCortexStore((s) => {
+    const w = s.webcam;
+    if (!w.lastUpdated) return null;
+    return {
+      timestamp: w.lastUpdated,
+      attentionScore: w.attentionScore ?? 0,
+      gazeDirection: w.gazeDirection as 'center' | 'left' | 'right' | 'down' | 'offscreen',
+      headPose: 'centered' as const,
+      distractionDurationSeconds: 0,
+      offscreenRatio60s: 0,
+      blinkRate: w.blinkRate ?? 0,
+      focusStability: 60,
+      gazeSwitchRate: 0,
+      faceDetected: w.faceDetected,
+      confidence: 0.7,
+      interpretedState: (w.state === 'focused'
+        ? 'Focused'
+        : w.state === 'distracted'
+          ? 'Distracted'
+          : w.state === 'fatigued'
+            ? 'Fatigued'
+            : w.state === 'searching'
+              ? 'Searching'
+              : w.state === 'overstimulated'
+                ? 'Overstimulated'
+                : 'Unknown') as
+        | 'Focused'
+        | 'Distracted'
+        | 'Fatigued'
+        | 'Searching'
+        | 'Overstimulated'
+        | 'Unknown',
+      source: w.source ?? 'simulated',
+    };
+  });
+  const screen = useCortexStore((s) =>
+    s.screen.lastUpdated
+      ? {
+          timestamp: s.screen.lastUpdated,
+          activeApp: s.screen.activeApp,
+          activeTitle: s.screen.activeContext,
+          windows: [],
+          tabCount: 0,
+          ocrTokens: [],
+          inferredTask: s.screen.inferredTask,
+          inferredProject: s.screen.project,
+          inferredIntent: '',
+          workflowState: s.screen.workflowState as
+            | 'flow'
+            | 'searching'
+            | 'switching'
+            | 'debugging'
+            | 'communicating'
+            | 'idle',
+          confidence: 0.8,
+          source: s.screen.source ?? 'simulated',
+        }
+      : null,
+  );
+  const memory = useCortexStore((s) => s.memory);
+  const reports = useCortexStore((s) => s.agent.reports);
+  const startDemo = useCortexStore((s) => s.startDemo);
+  const resetDemo = useCortexStore((s) => s.resetDemo);
+  const setSpeed = useCortexStore((s) => s.setSpeed);
+  const setManualState = useCortexStore((s) => s.setManualState);
+  const clearMemory = useCortexStore((s) => s.clearMemory);
+  const runAgent = useCortexStore((s) => s.runAgent);
+
+  return (
+    <AdminPage
+      compute={compute}
+      fallback={fallback}
+      assessment={assessment as never}
+      telemetry={telemetry}
+      attention={webcamMetrics as never}
+      attentionDiagnostic={attentionDiagnostic}
+      attentionStatus={attentionStatus}
+      screen={screen as never}
+      screenStatus={screenStatus}
+      memory={memory}
+      reports={reports}
+      onStartDemo={startDemo}
+      onResetDemo={resetDemo}
+      onSetSpeed={setSpeed}
+      onManualState={setManualState}
+      onClearMemory={clearMemory}
+      onRunAgent={runAgent}
+      onBack={onBack}
+    />
   );
 }
