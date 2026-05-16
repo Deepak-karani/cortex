@@ -348,6 +348,101 @@ app.get('/api/biometrics/heart-rate', (_req, res) => {
   res.json({ ok: true, sample: getLatestRealHeartRate() });
 });
 
+// ---- Health Auto Export bridge ---------------------------------------------
+// Health Auto Export (iOS app, https://www.healthexportapp.com) can push
+// HealthKit samples to a REST endpoint in real time. Its payload shape differs
+// from our simple bridge — this endpoint accepts the native shape and forwards
+// each sample through the same code path. Set the iOS app's "REST API
+// Automation" URL to:
+//   http://<this-mac>:4000/api/biometrics/health-auto-export
+// and check `Heart Rate` + optionally `Heart Rate Variability` in the data
+// types to send.
+
+interface HaeMetric {
+  name?: string;
+  units?: string;
+  data?: Array<{
+    qty?: number;
+    Avg?: number;
+    avg?: number;
+    Min?: number;
+    Max?: number;
+    date?: string;
+    source?: string;
+  }>;
+}
+interface HaePayload {
+  data?: { metrics?: HaeMetric[] };
+}
+
+function pickLatest(samples: HaeMetric['data'] | undefined): { qty: number; date: number; source: string } | null {
+  if (!samples || samples.length === 0) return null;
+  // Health Auto Export usually sorts oldest-first; we want the latest.
+  const latest = [...samples]
+    .map((s) => {
+      const qty = s.qty ?? s.Avg ?? s.avg ?? null;
+      if (qty == null || !Number.isFinite(qty)) return null;
+      const ts = s.date ? Date.parse(s.date) : Date.now();
+      return { qty, date: Number.isFinite(ts) ? ts : Date.now(), source: s.source ?? '' };
+    })
+    .filter((s): s is { qty: number; date: number; source: string } => !!s)
+    .sort((a, b) => b.date - a.date)[0];
+  return latest ?? null;
+}
+
+app.post('/api/biometrics/health-auto-export', (req, res) => {
+  if (BIOMETRICS_TOKEN) {
+    const auth = req.header('authorization') ?? '';
+    const presented = auth.replace(/^Bearer\s+/i, '');
+    if (presented !== BIOMETRICS_TOKEN) {
+      return res.status(401).json({ ok: false, error: 'unauthorized' });
+    }
+  }
+  const body = req.body as HaePayload;
+  const metrics = body?.data?.metrics ?? [];
+  if (!Array.isArray(metrics) || metrics.length === 0) {
+    return res.status(400).json({ ok: false, error: 'expected body.data.metrics array' });
+  }
+
+  const hrMetric = metrics.find((m) => /^heart[_ ]?rate$/i.test(m.name ?? ''));
+  const hrvMetric = metrics.find((m) =>
+    /heart[_ ]?rate[_ ]?variability/i.test(m.name ?? ''),
+  );
+  const latestHr = pickLatest(hrMetric?.data);
+  const latestHrv = pickLatest(hrvMetric?.data);
+
+  if (!latestHr) {
+    return res.status(400).json({
+      ok: false,
+      error: 'no heart_rate metric found in payload',
+      metricsSeen: metrics.map((m) => m.name),
+    });
+  }
+
+  const bpm = Math.max(30, Math.min(220, Math.round(latestHr.qty)));
+  const hrv =
+    latestHrv && Number.isFinite(latestHrv.qty)
+      ? Math.max(0, Math.min(250, Math.round(latestHrv.qty)))
+      : null;
+
+  const sample: LatestHeartRate = {
+    bpm,
+    hrv,
+    source: (latestHr.source || 'Apple Watch · Health Auto Export').slice(0, 48),
+    timestamp: latestHr.date,
+  };
+  latestRealHeartRate = sample;
+  io.emit('biometrics:hr', sample);
+  return res.json({
+    ok: true,
+    accepted: sample,
+    derivedFrom: {
+      heart_rate_samples: hrMetric?.data?.length ?? 0,
+      heart_rate_variability_samples: hrvMetric?.data?.length ?? 0,
+    },
+  });
+});
+
 // Discovery endpoint — Shortcut configures its POST URL from here.
 app.get('/api/biometrics/heart-rate/endpoint', (req, res) => {
   const host = req.header('host') ?? `localhost:${PORT}`;

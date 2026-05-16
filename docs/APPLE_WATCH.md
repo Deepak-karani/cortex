@@ -1,8 +1,15 @@
 # Connect your Apple Watch to Cortex Arena
 
 This walks you through wiring real Apple Watch heart rate samples into the
-**Heart Rate** card via an iOS Shortcut. No Apple Developer account, no Xcode,
-no extra app to install.
+**Heart Rate** card. Two paths — pick one:
+
+- **Health Auto Export** (recommended) — third-party iOS app, ~$3 one-time
+  for the REST API automation, real-time push from HealthKit, two-minute
+  setup. [Jump to the Health Auto Export setup ↓](#path-a--health-auto-export-recommended)
+- **iOS Shortcut + Personal Automation** — free, hand-built, ~10-minute
+  setup, runs on whatever cadence you set. [Jump to the Shortcut setup ↓](#path-b--ios-shortcut-free)
+
+Either way, no Apple Developer account, no Xcode, no extra app on the watch.
 
 > The flow: **Apple Watch → iPhone Health → iOS Shortcut → Cortex Arena**
 
@@ -11,7 +18,85 @@ the watch is worn — fine for a cognitive OS).
 
 ---
 
-## Step 1 — Pick the URL the Shortcut will POST to
+## Path A — Health Auto Export (recommended)
+
+[Health Auto Export](https://www.healthexportapp.com/) is a well-maintained
+iOS app that subscribes to HealthKit and pushes samples to a REST endpoint as
+they arrive. The "REST API Automation" feature is behind a one-time
+in-app-purchase (~$3 last we checked). Worth it.
+
+### A1 — Find your Mac's address
+
+Same as the Shortcut path — get the LAN IP your iPhone can reach:
+
+```bash
+ifconfig | grep "inet " | grep -v 127.0.0.1
+```
+
+Look for `192.168.x.x` (home Wi-Fi) or `10.x.x.x`. If you're on Tailscale,
+use the Tailscale 100.x.x.x address — it works regardless of network.
+
+Your POST URL is:
+
+```
+http://<your-mac-address>:4000/api/biometrics/health-auto-export
+```
+
+### A2 — Configure Health Auto Export
+
+1. Install **Health Auto Export** from the App Store.
+2. Open it. Grant Health permissions for at least **Heart Rate** and
+   **Heart Rate Variability**.
+3. Tap **Automations** at the bottom → **+** → **REST API**.
+4. Fill in:
+   - **URL:** the URL from A1
+   - **Method:** `POST`
+   - **Data Type:** `JSON`
+   - **Aggregation:** `Single Values` (we want individual samples, not daily summaries)
+   - **Frequency:** `Real-Time` (the most useful option — pushes as samples land)
+5. Under **Data Types**, enable:
+   - `Heart Rate`
+   - `Heart Rate Variability` (optional but recommended)
+6. Save.
+7. Tap **Run Now** once to verify. You should immediately see a green "ok"
+   from the server and the Heart Rate card should show your current BPM.
+
+### A3 — Watch the dashboard
+
+Within seconds:
+- The Heart Rate card source label flips to **Apple Watch · Health Auto Export** (or whatever Health Auto Export reports).
+- The Timeline panel gets a one-time **"Apple Watch connected"** entry.
+- Every new HealthKit sample updates the card live, with HRV alongside.
+
+That's it. Wear the watch through the demo — judges see your real BPM
+respond to whatever's happening in the room.
+
+### How the payload is handled
+
+Health Auto Export's body looks roughly like:
+
+```json
+{
+  "data": {
+    "metrics": [
+      { "name": "heart_rate", "units": "count/min", "data": [{ "qty": 72, "date": "...", "source": "Apple Watch" }] },
+      { "name": "heart_rate_variability", "units": "ms", "data": [{ "qty": 58, "date": "..." }] }
+    ]
+  }
+}
+```
+
+The Cortex endpoint pulls the latest sample from each metric, clamps the
+values to safe ranges, preserves the original timestamp and source, and
+emits a single `biometrics:hr` event into the system. No data is persisted.
+
+---
+
+## Path B — iOS Shortcut (free)
+
+This is the manual approach. Works fine; just needs you to build the chain.
+
+### Step 1 — Pick the URL the Shortcut will POST to
 
 On the Mac running Cortex Arena (the same machine the dashboard is open on),
 open a terminal and run:
@@ -39,7 +124,7 @@ That returns the canonical URL Cortex expects.
 
 ---
 
-## Step 2 — Build the Shortcut on your iPhone
+### Step 2 — Build the Shortcut on your iPhone
 
 Open the **Shortcuts** app on your iPhone (the watch will run it via the
 paired iPhone — no need to install anything on the watch itself).
@@ -84,7 +169,7 @@ should see a green "ok" on the Heart Rate card in the dashboard within seconds.
 
 ---
 
-## Step 3 — Make it automatic
+### Step 3 — Make it automatic
 
 Two options. Pick whichever fits your demo style.
 
@@ -108,7 +193,7 @@ Cortex saw it."
 
 ---
 
-## Step 4 — (Optional) HRV alongside HR
+### Step 4 — (Optional) HRV alongside HR
 
 To also send HRV, in Step 1 use Sample Type **Heart Rate Variability SDNN**
 instead, copy the result into a second variable, and add a `hrv` key to the
