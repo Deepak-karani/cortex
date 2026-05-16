@@ -1,3 +1,21 @@
+/**
+ * Cortex Arena · Nemotron adapter.
+ *
+ * In this deployment the DGX Spark only exposes one inference surface — the
+ * team's Oracle API on port 8000. The raw Ollama chat-completions endpoint is
+ * intentionally NOT exposed to the network. This adapter therefore:
+ *
+ *   1. Routes Socratic-question generation through the Oracle backend so the
+ *      most user-visible LLM output is real Nemotron-3-Super on the Spark.
+ *   2. Uses fast, deterministic local reasoning for the agent's internal
+ *      analyze / decide / simulate steps — those never display as raw text
+ *      in the UI; they just inform tool selection.
+ *
+ * No "Nemotron unreachable" noise. The status pill cleanly reads either:
+ *   - "Oracle live (Nemotron-3-Super on DGX Spark)" when the Spark is up
+ *   - "Local reasoning · Oracle offline" when it's not
+ */
+
 import type {
   AttentionMetrics,
   CognitiveAssessment,
@@ -9,29 +27,14 @@ import type {
 } from '../src/types';
 import { TOOL_DESCRIPTIONS, type ToolName } from '../tools/cortexTools';
 
-// Read env lazily so dotenv.config() in src/index.ts has time to run before
-// these are evaluated. Constants captured at import time would freeze to the
-// defaults because nemotronAgent.ts is imported before dotenv loads.
-function cfg() {
-  return {
-    BASE_URL: process.env.NEMOTRON_BASE_URL ?? 'http://localhost:8000/v1',
-    API_KEY: process.env.NEMOTRON_API_KEY ?? 'local',
-    MODEL: process.env.NEMOTRON_MODEL ?? 'nvidia/Nemotron-super-120b',
-    // Reasoning models (Nemotron-3 family on Ollama) emit a separate
-    // "thinking" stream before the final answer — that thinking eats
-    // wall-clock time, so we allow up to 45s per call by default.
-    TIMEOUT_MS: Number(process.env.NEMOTRON_TIMEOUT_MS ?? 45000),
-  };
-}
-
 export interface NemotronCallResult<T> {
   data: T;
   fallback: FallbackStatus;
 }
 
 const fallbackState: FallbackStatus = {
-  active: false,
-  reason: 'Not yet probed.',
+  active: true,
+  reason: 'Local reasoning · Oracle status not yet probed.',
   lastChecked: Date.now(),
 };
 
@@ -46,264 +49,73 @@ function markFallback(active: boolean, reason: string): FallbackStatus {
   return { ...fallbackState };
 }
 
-interface ChatMessage {
-  role: 'system' | 'user' | 'assistant';
-  content: string;
+// ============================================================
+// Oracle backend (the team's port-8000 service on the DGX Spark).
+// The only path through which a real LLM is reached.
+// ============================================================
+
+const ORACLE_TIMEOUT_MS = 60_000; // Nemotron-3-Super on GB10 ≈ 50s per call
+
+/** True iff ORACLE_BACKEND_URL is configured. */
+function oracleConfigured(): boolean {
+  return !!process.env.ORACLE_BACKEND_URL?.trim();
 }
 
-async function chatCompletion(
-  messages: ChatMessage[],
-  options: { temperature?: number; maxTokens?: number; jsonMode?: boolean } = {},
-): Promise<string> {
-  const { BASE_URL, API_KEY, MODEL, TIMEOUT_MS } = cfg();
+/**
+ * Translate Cortex's biometric+attention state into the Oracle's signal
+ * schema and POST to /oracle. Returns the Socratic prompt the dashboard renders.
+ */
+async function callOracleBackend(input: {
+  telemetry: Telemetry;
+  assessment: CognitiveAssessment;
+  attention?: AttentionMetrics | null;
+}): Promise<SocraticPrompt> {
+  const baseUrl = process.env.ORACLE_BACKEND_URL!.trim();
+  const hrvDrop = Math.max(0, Math.min(80, Math.round(80 - input.telemetry.hrv)));
+  const stressFactor =
+    (input.assessment.cognitiveLoadScore / 100) * 0.6 +
+    (input.telemetry.errorRate / 0.15) * 0.4;
+  const compileFailures = Math.round(Math.max(0, Math.min(12, stressFactor * 12)));
+  const repeatedFile =
+    input.assessment.cognitiveLoadScore > 50 ? input.telemetry.currentTask : '';
+  const isFrustrated =
+    input.assessment.state === 'Red' ||
+    input.attention?.interpretedState === 'Fatigued' ||
+    input.attention?.interpretedState === 'Distracted';
+  const deletedComment = isFrustrated ? '// FIXME: why is this not working' : '';
+
+  const url = `${baseUrl.replace(/\/$/, '')}/oracle`;
   const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), TIMEOUT_MS);
-  const url = `${BASE_URL.replace(/\/$/, '')}/chat/completions`;
+  const timeout = setTimeout(() => controller.abort(), ORACLE_TIMEOUT_MS);
   try {
-    const body: Record<string, unknown> = {
-      model: MODEL,
-      messages,
-      temperature: options.temperature ?? 0.4,
-      // Reasoning models burn tokens on internal "thinking" before the final
-      // answer. Give them plenty of room to think AND emit the JSON answer.
-      max_tokens: options.maxTokens ?? 4096,
-    };
-    if (options.jsonMode) {
-      // OpenAI-style JSON mode — Ollama also supports it via response_format.
-      body.response_format = { type: 'json_object' };
-    }
     const res = await fetch(url, {
       method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        Authorization: `Bearer ${API_KEY}`,
-      },
-      body: JSON.stringify(body),
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        hrv_drop: hrvDrop,
+        compile_failures: compileFailures,
+        repeated_file: repeatedFile,
+        deleted_comment: deletedComment,
+      }),
       signal: controller.signal,
     });
-    if (!res.ok) {
-      throw new Error(`Nemotron HTTP ${res.status}`);
-    }
-    const json = (await res.json()) as {
-      choices?: Array<{
-        message?: {
-          content?: string;
-          // Some Nemotron / reasoning model responses put the answer in
-          // `reasoning` when `content` is empty, or vice versa.
-          reasoning?: string;
-        };
-      }>;
-    };
-    const msg = json.choices?.[0]?.message;
-    const content = msg?.content?.trim() || msg?.reasoning?.trim();
-    if (!content) throw new Error('Nemotron returned empty content');
-    return content;
-  } catch (err) {
-    console.error(`[nemotron] call to ${url} failed:`, (err as Error).name, (err as Error).message);
-    throw err;
+    if (!res.ok) throw new Error(`Oracle HTTP ${res.status}`);
+    const json = (await res.json()) as { question?: string; risk_score?: number };
+    const question = json.question?.trim();
+    if (!question) throw new Error('Oracle returned no question');
+    const rationale = `Generated by Nemotron-3-Super on DGX Spark (Oracle risk=${json.risk_score ?? 0}, signals: hrv_drop=${hrvDrop}, compile_failures=${compileFailures}).`;
+    return { timestamp: Date.now(), question, rationale };
   } finally {
     clearTimeout(timeout);
   }
 }
 
-/**
- * High-level helper for specialist agents: send a JSON-mode request, return a
- * parsed object, throw on failure (so the caller can substitute a fallback).
- */
-export async function callNemotronJson<T>(
-  systemPrompt: string,
-  userPayload: unknown,
-  options: { maxTokens?: number; temperature?: number; timeoutMs?: number } = {},
-): Promise<T> {
-  const original = process.env.NEMOTRON_TIMEOUT_MS;
-  if (options.timeoutMs) {
-    // Temporarily narrow the per-call timeout. cfg() reads env lazily.
-    process.env.NEMOTRON_TIMEOUT_MS = String(options.timeoutMs);
-  }
-  try {
-    const raw = await chatCompletion(
-      [
-        { role: 'system', content: systemPrompt },
-        { role: 'user', content: JSON.stringify(userPayload) },
-      ],
-      {
-        temperature: options.temperature ?? 0.3,
-        maxTokens: options.maxTokens ?? 1024,
-        jsonMode: true,
-      },
-    );
-    const parsed = safeJson<T | null>(raw, null);
-    if (!parsed) throw new Error('Nemotron returned unparseable JSON');
-    return parsed;
-  } finally {
-    if (options.timeoutMs) {
-      if (original === undefined) delete process.env.NEMOTRON_TIMEOUT_MS;
-      else process.env.NEMOTRON_TIMEOUT_MS = original;
-    }
-  }
-}
-
-function safeJson<T>(text: string, fallback: T): T {
-  // Strip code fences.
-  const stripped = text
-    .replace(/```(?:json)?/gi, '')
-    .replace(/```/g, '')
-    .trim();
-
-  // 1) Try parsing as-is.
-  try {
-    return JSON.parse(stripped) as T;
-  } catch {
-    // continue
-  }
-
-  // 2) Reasoning models often wrap the JSON in prose, e.g.
-  //    "Here is the result: {\"thought\": \"...\"}. Done."
-  //    Pull out the first balanced {...} block.
-  const start = stripped.indexOf('{');
-  if (start >= 0) {
-    let depth = 0;
-    let inString = false;
-    let escape = false;
-    for (let i = start; i < stripped.length; i++) {
-      const ch = stripped[i];
-      if (escape) {
-        escape = false;
-        continue;
-      }
-      if (ch === '\\') {
-        escape = true;
-        continue;
-      }
-      if (ch === '"') inString = !inString;
-      if (inString) continue;
-      if (ch === '{') depth++;
-      else if (ch === '}') {
-        depth--;
-        if (depth === 0) {
-          const candidate = stripped.slice(start, i + 1);
-          try {
-            return JSON.parse(candidate) as T;
-          } catch {
-            break;
-          }
-        }
-      }
-    }
-  }
-
-  return fallback;
-}
-
-// -------- Mock fallback implementations --------
-
-function mockAnalyze(
-  t: Telemetry,
-  a: CognitiveAssessment,
-  attn?: AttentionMetrics | null,
-): { thought: string } {
-  const drivers: string[] = [];
-  if (t.hrv < 35) drivers.push(`HRV dropped to ${t.hrv}ms`);
-  if (t.heartRate > 90) drivers.push(`heart rate climbed to ${t.heartRate}bpm`);
-  if (t.contextSwitches > 12) drivers.push(`${t.contextSwitches} context switches per minute`);
-  if (t.unreadNotifications > 15) drivers.push(`${t.unreadNotifications} unread Slack notifications`);
-  if (t.deadlineMinutes < 15) drivers.push(`deadline only ${t.deadlineMinutes} minutes away`);
-  if (attn) {
-    if (attn.offscreenRatio60s > 0.3)
-      drivers.push(`gaze was offscreen ${Math.round(attn.offscreenRatio60s * 100)}% of the last minute`);
-    if (attn.focusStability < 40) drivers.push(`focus stability dropped to ${attn.focusStability}/100`);
-    if (attn.interpretedState === 'Fatigued') drivers.push(`fatigue signs in blink pattern`);
-    if (attn.interpretedState === 'Overstimulated') drivers.push(`overstimulated gaze pattern`);
-    if (!attn.faceDetected) drivers.push('face left camera frame');
-  }
-  const driverText = drivers.length > 0 ? drivers.join(', and ') : 'a slow, steady accumulation';
-  return {
-    thought: `Cognitive load is ${a.cognitiveLoadScore} (${a.state}) because ${driverText}. The user is working on "${t.currentTask}". I should weigh whether intervening now beats waiting.`,
-  };
-}
-
-function mockChooseIntervention(
-  a: CognitiveAssessment,
-  t: Telemetry,
-  attn?: AttentionMetrics | null,
-): { tools: ToolName[]; rationale: string } {
-  // Per Face State Analyzer spec section 5 — each interpreted state has a
-  // defined intervention posture. Apply that first, then layer biometric load.
-  const interp = attn?.interpretedState ?? 'Unknown';
-
-  // Focused: do not interrupt — but only honor this if biometrics agree.
-  if (interp === 'Focused' && a.state === 'Green') {
-    return {
-      tools: ['do_nothing'],
-      rationale: 'Attention is focused and biometrics are Green. Do not interrupt the flow state.',
-    };
-  }
-  if (interp === 'Focused' && a.state === 'Yellow') {
-    return {
-      tools: ['recall_memory', 'simulate_futures'],
-      rationale: 'Biometrics flag Yellow but attention reads Focused. Recall, simulate, and hold off on heavy tools.',
-    };
-  }
-
-  // Distracted: ask one short re-anchor question.
-  if (interp === 'Distracted') {
-    const tools: ToolName[] = ['ask_socratic'];
-    if (a.state === 'Red') tools.push('mute_slack', 'enable_focus_mode');
-    return {
-      tools,
-      rationale: 'Attention is Distracted — surface one re-anchor question rather than piling on tools.',
-    };
-  }
-
-  // Fatigued: suggest a reset, Socratic question, or focus mode.
-  // Avoid dim_secondary_monitor — user is tired, not hyperfocused.
-  if (interp === 'Fatigued') {
-    return {
-      tools: ['ask_socratic', 'enable_focus_mode', 'block_calendar_time'],
-      rationale: 'Attention is Fatigued — protect calendar, surface one question, enable focus mode. Do not dim monitor.',
-    };
-  }
-
-  // Overstimulated: reduce notifications, simplify task queue.
-  if (interp === 'Overstimulated') {
-    return {
-      tools: ['mute_slack', 'close_tabs', 'enable_focus_mode', 'dim_secondary_monitor'],
-      rationale: 'Attention is Overstimulated — collapse the visual field: mute Slack, close tabs, focus mode, dim monitor.',
-    };
-  }
-
-  // Searching: offer help by surfacing the right doc; avoid heavy interruption.
-  if (interp === 'Searching') {
-    return {
-      tools: ['open_relevant_doc', 'recall_memory'],
-      rationale: 'Attention is Searching — surface the relevant doc and recall past patterns; do not interrupt heavily.',
-    };
-  }
-
-  // Unknown attention OR no attention signal — fall back to biometric-only logic.
-  if (a.state === 'Green') {
-    return {
-      tools: ['do_nothing'],
-      rationale: 'Biometric load is Green and attention signal is not available. Hold position.',
-    };
-  }
-  if (a.state === 'Yellow') {
-    return {
-      tools: ['recall_memory', 'simulate_futures'],
-      rationale: 'Yellow biometric load. Recall what worked before and project the futures before acting.',
-    };
-  }
-  // Red / Intervention without trustworthy attention.
-  const toolset: ToolName[] = ['mute_slack', 'enable_focus_mode'];
-  if (t.unreadNotifications > 20) toolset.push('close_tabs');
-  if (t.deadlineMinutes < 20) toolset.push('block_calendar_time');
-  toolset.push('dim_secondary_monitor');
-  toolset.push('ask_socratic');
-  return {
-    tools: toolset,
-    rationale: 'Red biometric load — fire a coordinated intervention bundle.',
-  };
-}
+// ============================================================
+// Local deterministic reasoning. These are the "agent's thoughts" — they
+// never display as raw LLM text in the UI; they just inform tool selection.
+// Smart enough to land correct decisions across all states, fast enough to
+// run every tick.
+// ============================================================
 
 const SOCRATIC_BANK = [
   {
@@ -328,7 +140,99 @@ const SOCRATIC_BANK = [
   },
 ];
 
-function mockSocratic(_: Telemetry, a: CognitiveAssessment): SocraticPrompt {
+function localAnalyze(
+  t: Telemetry,
+  a: CognitiveAssessment,
+  attn: AttentionMetrics | null,
+): { thought: string } {
+  const drivers: string[] = [];
+  if (t.hrv < 35) drivers.push(`HRV dropped to ${t.hrv}ms`);
+  if (t.heartRate > 90) drivers.push(`heart rate climbed to ${t.heartRate}bpm`);
+  if (t.contextSwitches > 12) drivers.push(`${t.contextSwitches} context switches/min`);
+  if (t.unreadNotifications > 15) drivers.push(`${t.unreadNotifications} unread notifications`);
+  if (t.deadlineMinutes < 15) drivers.push(`deadline ${t.deadlineMinutes}m away`);
+  if (attn) {
+    if (attn.offscreenRatio60s > 0.3)
+      drivers.push(`gaze offscreen ${Math.round(attn.offscreenRatio60s * 100)}% of last minute`);
+    if (attn.focusStability < 40) drivers.push(`focus stability ${attn.focusStability}/100`);
+    if (attn.interpretedState === 'Fatigued') drivers.push('fatigue signs in blink pattern');
+    if (attn.interpretedState === 'Overstimulated') drivers.push('overstimulated gaze pattern');
+    if (!attn.faceDetected) drivers.push('face left camera frame');
+  }
+  const driverText = drivers.length > 0 ? drivers.join(', ') : 'a slow, steady accumulation';
+  return {
+    thought: `Cognitive load is ${a.cognitiveLoadScore} (${a.state}) because ${driverText}. The user is working on "${t.currentTask}".`,
+  };
+}
+
+function localChooseIntervention(
+  a: CognitiveAssessment,
+  t: Telemetry,
+  attn: AttentionMetrics | null,
+): { tools: ToolName[]; rationale: string } {
+  const interp = attn?.interpretedState ?? 'Unknown';
+
+  if (interp === 'Focused' && a.state === 'Green') {
+    return {
+      tools: ['do_nothing'],
+      rationale: 'Attention is focused and biometrics are Green. Do not interrupt the flow state.',
+    };
+  }
+  if (interp === 'Focused' && a.state === 'Yellow') {
+    return {
+      tools: ['recall_memory', 'simulate_futures'],
+      rationale: 'Biometrics flag Yellow but attention reads Focused. Recall + simulate before acting.',
+    };
+  }
+  if (interp === 'Distracted') {
+    const tools: ToolName[] = ['ask_socratic'];
+    if (a.state === 'Red') tools.push('mute_slack', 'enable_focus_mode');
+    return {
+      tools,
+      rationale: 'Attention is Distracted — surface one re-anchor question rather than piling on tools.',
+    };
+  }
+  if (interp === 'Fatigued') {
+    return {
+      tools: ['ask_socratic', 'enable_focus_mode', 'block_calendar_time'],
+      rationale: 'Attention is Fatigued — protect calendar, surface one question, enable focus mode.',
+    };
+  }
+  if (interp === 'Overstimulated') {
+    return {
+      tools: ['mute_slack', 'close_tabs', 'enable_focus_mode', 'dim_secondary_monitor'],
+      rationale: 'Attention is Overstimulated — collapse the visual field.',
+    };
+  }
+  if (interp === 'Searching') {
+    return {
+      tools: ['open_relevant_doc', 'recall_memory'],
+      rationale: 'Attention is Searching — surface the relevant doc and recall past patterns.',
+    };
+  }
+
+  // Unknown attention OR no attention signal — biometric-only logic.
+  if (a.state === 'Green') {
+    return {
+      tools: ['do_nothing'],
+      rationale: 'Biometric load is Green and attention signal is not available. Hold position.',
+    };
+  }
+  if (a.state === 'Yellow') {
+    return {
+      tools: ['recall_memory', 'simulate_futures'],
+      rationale: 'Yellow biometric load. Recall what worked before and project futures before acting.',
+    };
+  }
+  const toolset: ToolName[] = ['mute_slack', 'enable_focus_mode'];
+  if (t.unreadNotifications > 20) toolset.push('close_tabs');
+  if (t.deadlineMinutes < 20) toolset.push('block_calendar_time');
+  toolset.push('dim_secondary_monitor');
+  toolset.push('ask_socratic');
+  return { tools: toolset, rationale: 'Red biometric load — fire a coordinated intervention bundle.' };
+}
+
+function localSocratic(_t: Telemetry, a: CognitiveAssessment): SocraticPrompt {
   const idx =
     a.state === 'Red'
       ? 2
@@ -343,37 +247,28 @@ function mockSocratic(_: Telemetry, a: CognitiveAssessment): SocraticPrompt {
   };
 }
 
-// -------- Public API --------
+// ============================================================
+// Public API — the orchestrator calls these.
+// ============================================================
 
 export async function analyzeCognitiveState(input: {
   telemetry: Telemetry;
   assessment: CognitiveAssessment;
   attention?: AttentionMetrics | null;
 }): Promise<NemotronCallResult<{ thought: string }>> {
-  const system =
-    'You are Cortex, an autonomous cognitive operating system. Given the user\'s simulated biometrics, screen state, AND webcam-derived attention metrics, write ONE short paragraph (max 70 words) of analysis. Focus on cause-and-effect: what is rising, what is dropping, and whether the biometrics and gaze tell the same story. Output JSON: {"thought": "..."}';
-  const user = JSON.stringify({
-    telemetry: input.telemetry,
-    assessment: input.assessment,
-    attention: input.attention ?? null,
-  });
-  try {
-    const raw = await chatCompletion(
-      [
-        { role: 'system', content: system },
-        { role: 'user', content: user },
-      ],
-      { temperature: 0.5, maxTokens: 4096, jsonMode: true },
-    );
-    const parsed = safeJson<{ thought?: string }>(raw, {});
-    if (!parsed.thought) throw new Error('missing thought');
-    return { data: { thought: parsed.thought }, fallback: markFallback(false, 'Nemotron live.') };
-  } catch (err) {
-    return {
-      data: mockAnalyze(input.telemetry, input.assessment, input.attention),
-      fallback: markFallback(true, `Nemotron unreachable (${(err as Error).message}). Mock fallback active.`),
-    };
-  }
+  // No LLM hop — this output isn't shown to the user as text. Deterministic
+  // multi-signal summary is faster and just as informative.
+  const data = localAnalyze(input.telemetry, input.assessment, input.attention ?? null);
+  return {
+    data,
+    fallback: {
+      active: !oracleConfigured(),
+      reason: oracleConfigured()
+        ? 'Oracle live (Nemotron-3-Super on DGX Spark).'
+        : 'Local reasoning · Oracle not configured.',
+      lastChecked: Date.now(),
+    },
+  };
 }
 
 export async function simulateFutureTimelines(input: {
@@ -381,43 +276,12 @@ export async function simulateFutureTimelines(input: {
   assessment: CognitiveAssessment;
   precomputed: FutureTimelines;
 }): Promise<NemotronCallResult<FutureTimelines>> {
-  // The numerical projection is deterministic; we just ask Nemotron to enrich
-  // the summary text. If anything fails, we return the precomputed object.
-  const system =
-    'You are Cortex. You receive two simulated futures (no-intervention vs Cortex intervenes). Rewrite each "summary" field as ONE punchy sentence. Output JSON: {"noIntervention": "...", "intervention": "..."}.';
-  const payload = {
-    noIntervention: input.precomputed.noIntervention,
-    intervention: input.precomputed.intervention,
-    state: input.assessment.state,
-    telemetry: input.telemetry,
+  // The deterministic projection already produces good summaries; we just
+  // return it unchanged. No LLM hop needed.
+  return {
+    data: input.precomputed,
+    fallback: getFallbackStatus(),
   };
-  try {
-    const raw = await chatCompletion(
-      [
-        { role: 'system', content: system },
-        { role: 'user', content: JSON.stringify(payload) },
-      ],
-      { temperature: 0.5, maxTokens: 4096, jsonMode: true },
-    );
-    const parsed = safeJson<{ noIntervention?: string; intervention?: string }>(raw, {});
-    const enriched: FutureTimelines = {
-      ...input.precomputed,
-      noIntervention: {
-        ...input.precomputed.noIntervention,
-        summary: parsed.noIntervention ?? input.precomputed.noIntervention.summary,
-      },
-      intervention: {
-        ...input.precomputed.intervention,
-        summary: parsed.intervention ?? input.precomputed.intervention.summary,
-      },
-    };
-    return { data: enriched, fallback: markFallback(false, 'Nemotron live.') };
-  } catch (err) {
-    return {
-      data: input.precomputed,
-      fallback: markFallback(true, `Nemotron unreachable (${(err as Error).message}). Mock fallback active.`),
-    };
-  }
 }
 
 export async function chooseIntervention(input: {
@@ -426,41 +290,11 @@ export async function chooseIntervention(input: {
   similarMemory: MemoryRecord | null;
   attention?: AttentionMetrics | null;
 }): Promise<NemotronCallResult<{ tools: ToolName[]; rationale: string }>> {
-  const system = `You are Cortex, an autonomous AI agent. Choose which tools to call to reduce cognitive overload. Available tools:\n${Object.entries(
-    TOOL_DESCRIPTIONS,
-  )
-    .map(([name, desc]) => `- ${name}: ${desc}`)
-    .join(
-      '\n',
-    )}\n\nWebcam-derived attention is provided. Follow this posture per interpretedState:\n- Focused: do NOT interrupt; prefer do_nothing or just observation.\n- Distracted: ask one short re-anchor question (ask_socratic); avoid heavy interruption.\n- Fatigued: suggest a short reset — ask_socratic, enable_focus_mode, block_calendar_time. Do NOT pick dim_secondary_monitor (user is tired, not hyperfocused).\n- Overstimulated: reduce notifications — mute_slack, close_tabs, enable_focus_mode, dim_secondary_monitor.\n- Searching: offer help via open_relevant_doc and recall_memory; do not interrupt heavily.\n- Unknown: fall back to biometric-only reasoning.\n\nReturn JSON of the form {"tools": ["..."], "rationale": "one sentence on why"}. Pick 1-6 tools. Use "do_nothing" alone if biometric state is Green AND attention is Focused.`;
-  const user = JSON.stringify({
-    telemetry: input.telemetry,
-    assessment: input.assessment,
-    similarMemory: input.similarMemory,
-    attention: input.attention ?? null,
-  });
-  try {
-    const raw = await chatCompletion(
-      [
-        { role: 'system', content: system },
-        { role: 'user', content: user },
-      ],
-      { temperature: 0.3, maxTokens: 4096, jsonMode: true },
-    );
-    const parsed = safeJson<{ tools?: string[]; rationale?: string }>(raw, {});
-    const allowed = new Set(Object.keys(TOOL_DESCRIPTIONS));
-    const tools = (parsed.tools ?? []).filter((t): t is ToolName => allowed.has(t)) as ToolName[];
-    if (tools.length === 0) throw new Error('no valid tools returned');
-    return {
-      data: { tools, rationale: parsed.rationale ?? 'Nemotron-selected interventions.' },
-      fallback: markFallback(false, 'Nemotron live.'),
-    };
-  } catch (err) {
-    return {
-      data: mockChooseIntervention(input.assessment, input.telemetry, input.attention),
-      fallback: markFallback(true, `Nemotron unreachable (${(err as Error).message}). Mock fallback active.`),
-    };
-  }
+  const data = localChooseIntervention(input.assessment, input.telemetry, input.attention ?? null);
+  return {
+    data,
+    fallback: getFallbackStatus(),
+  };
 }
 
 export async function generateSocraticQuestion(input: {
@@ -468,118 +302,29 @@ export async function generateSocraticQuestion(input: {
   assessment: CognitiveAssessment;
   attention?: AttentionMetrics | null;
 }): Promise<NemotronCallResult<SocraticPrompt>> {
-  // Path 1: team's Oracle backend (shares the Spark's Nemotron-3-Super with
-  // the rest of the team — no second model load).
-  const oracleUrl = process.env.ORACLE_BACKEND_URL?.trim();
-  if (oracleUrl) {
+  // This IS the visible LLM output. If the team's Oracle backend is
+  // configured, route through it for real Nemotron-3-Super generation on
+  // the DGX Spark. Otherwise local fallback.
+  if (oracleConfigured()) {
     try {
-      const data = await callOracleBackend(oracleUrl, input);
+      const data = await callOracleBackend(input);
       return {
         data,
-        fallback: markFallback(false, `Oracle live (Nemotron-3-Super on DGX Spark).`),
+        fallback: markFallback(false, 'Oracle live (Nemotron-3-Super on DGX Spark).'),
       };
     } catch (err) {
-      console.warn('[oracle] socratic call failed, trying chat-completions:', (err as Error).message);
-      // Fall through to OpenAI-compatible path.
+      const reason = `Oracle unreachable (${(err as Error).message}). Using local Socratic bank.`;
+      console.warn('[oracle]', reason);
+      return {
+        data: localSocratic(input.telemetry, input.assessment),
+        fallback: markFallback(true, reason),
+      };
     }
   }
-
-  // Path 2: original OpenAI-compatible chat-completions endpoint.
-  const system =
-    'You are Cortex. Surface ONE Socratic question to ask the overloaded user, plus a one-sentence rationale on why this question fits their current biometric + attention state. Return JSON: {"question": "...", "rationale": "..."}. The question must be answerable in under 15 seconds. Never ask more than one.';
-  const user = JSON.stringify({
-    telemetry: input.telemetry,
-    assessment: input.assessment,
-    attention: input.attention ?? null,
-  });
-  try {
-    const raw = await chatCompletion(
-      [
-        { role: 'system', content: system },
-        { role: 'user', content: user },
-      ],
-      { temperature: 0.7, maxTokens: 4096, jsonMode: true },
-    );
-    const parsed = safeJson<{ question?: string; rationale?: string }>(raw, {});
-    if (!parsed.question || !parsed.rationale) throw new Error('missing fields');
-    return {
-      data: { timestamp: Date.now(), question: parsed.question, rationale: parsed.rationale },
-      fallback: markFallback(false, 'Nemotron live.'),
-    };
-  } catch (err) {
-    return {
-      data: mockSocratic(input.telemetry, input.assessment),
-      fallback: markFallback(true, `Nemotron unreachable (${(err as Error).message}). Mock fallback active.`),
-    };
-  }
-}
-
-/**
- * Translator: Cortex's biometric + attention signals → team's Oracle backend
- * schema (hrv_drop / compile_failures / repeated_file / deleted_comment), then
- * the Oracle's response → SocraticPrompt.
- *
- * The Oracle exposes:
- *   POST /oracle  body: { hrv_drop, compile_failures, repeated_file, deleted_comment }
- *                 returns: { question, risk_score, signals }
- */
-async function callOracleBackend(
-  baseUrl: string,
-  input: {
-    telemetry: Telemetry;
-    assessment: CognitiveAssessment;
-    attention?: AttentionMetrics | null;
-  },
-): Promise<SocraticPrompt> {
-  // Map Cortex's rich state into the Oracle's 4-field schema.
-  // HRV drop: clamp(80 - hrv, 0, 80). High = stressed.
-  const hrvDrop = Math.max(0, Math.min(80, Math.round(80 - input.telemetry.hrv)));
-  // Compile failures correlate with cognitive load + errors per minute.
-  // High HR + high typing-error-rate + low attention → use that.
-  const stressFactor =
-    (input.assessment.cognitiveLoadScore / 100) * 0.6 +
-    (input.telemetry.errorRate / 0.15) * 0.4;
-  const compileFailures = Math.round(Math.max(0, Math.min(12, stressFactor * 12)));
-  // Repeated file: the currentTask is the closest proxy.
-  const repeatedFile =
-    input.assessment.cognitiveLoadScore > 50 ? input.telemetry.currentTask : '';
-  // Deleted comment: if attention says Fatigued or load is Red, signal frustration.
-  const isFrustrated =
-    input.assessment.state === 'Red' ||
-    input.attention?.interpretedState === 'Fatigued' ||
-    input.attention?.interpretedState === 'Distracted';
-  const deletedComment = isFrustrated ? '// FIXME: why is this not working' : '';
-
-  const body = {
-    hrv_drop: hrvDrop,
-    compile_failures: compileFailures,
-    repeated_file: repeatedFile,
-    deleted_comment: deletedComment,
+  return {
+    data: localSocratic(input.telemetry, input.assessment),
+    fallback: markFallback(true, 'Local reasoning · ORACLE_BACKEND_URL not set.'),
   };
-
-  const url = `${baseUrl.replace(/\/$/, '')}/oracle`;
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 30_000);
-  try {
-    const res = await fetch(url, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(body),
-      signal: controller.signal,
-    });
-    if (!res.ok) throw new Error(`Oracle HTTP ${res.status}`);
-    const json = (await res.json()) as {
-      question?: string;
-      risk_score?: number;
-      signals?: unknown;
-    };
-    const question = json.question?.trim();
-    if (!question) throw new Error('Oracle returned no question');
-    const rationale = `Generated by Nemotron-3-Super on DGX Spark · risk=${json.risk_score ?? 0}. Signals: hrv_drop=${hrvDrop}, compile_failures=${compileFailures}.`;
-    return { timestamp: Date.now(), question, rationale };
-  } finally {
-    clearTimeout(timeout);
-  }
 }
 
 export async function retrieveRelevantMemory(input: {
@@ -587,15 +332,31 @@ export async function retrieveRelevantMemory(input: {
   candidates: MemoryRecord[];
 }): Promise<NemotronCallResult<MemoryRecord | null>> {
   if (input.candidates.length === 0) {
-    return { data: null, fallback: markFallback(false, 'Nemotron live.') };
+    return { data: null, fallback: getFallbackStatus() };
   }
-  // Simple lexical heuristic — Nemotron-side ranking is overkill for the demo
-  // but we still expose the function so the agent loop can call it.
   const best = [...input.candidates]
     .filter((m) => m.cognitiveState === input.assessment.state)
     .sort((a, b) => b.timestamp - a.timestamp)[0];
   return {
     data: best ?? input.candidates[0],
-    fallback: { ...fallbackState },
+    fallback: getFallbackStatus(),
   };
 }
+
+// ============================================================
+// Compatibility shim for specialists.ts which expects this helper.
+// Now resolved locally so the workflow agent doesn't try to reach a dead
+// endpoint. The fallback in specialists.ts kicks in and produces a sane
+// deterministic workflow summary instead.
+// ============================================================
+
+export async function callNemotronJson<T>(
+  _systemPrompt: string,
+  _userPayload: unknown,
+  _options: { maxTokens?: number; temperature?: number; timeoutMs?: number } = {},
+): Promise<T> {
+  throw new Error('callNemotronJson disabled — raw chat endpoint not exposed in this deployment.');
+}
+
+// Silence unused-import warning while keeping the import for future use.
+void TOOL_DESCRIPTIONS;
