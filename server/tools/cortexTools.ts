@@ -1,3 +1,5 @@
+import { exec } from 'child_process';
+import { promisify } from 'util';
 import type {
   CognitiveAssessment,
   FutureTimelines,
@@ -14,6 +16,73 @@ import {
   evaluateToolCall,
   recordAudit,
 } from './policy';
+
+const execAsync = promisify(exec);
+
+/**
+ * Real-execution toggle. When CORTEX_REAL_TOOLS=true, the small subset of
+ * tools that have safe OS hooks (currently open_relevant_doc) will actually
+ * perform their action. Off by default so a demo doesn't surprise-launch
+ * windows. The pitch line stays the same either way — the *decision* and
+ * *audit* are real regardless; this flag only controls whether the
+ * execution layer is wired or stubbed.
+ */
+function realToolsEnabled(): boolean {
+  return process.env.CORTEX_REAL_TOOLS === 'true';
+}
+
+/**
+ * Validate a URL before handing it to the OS `open` command. We only accept
+ * http(s) — anything else (file://, javascript:, custom schemes) is
+ * refused. Length-bounded to keep the command line sane.
+ */
+function isSafeHttpUrl(raw: string): boolean {
+  if (!raw || raw.length > 512) return false;
+  try {
+    const u = new URL(raw);
+    return u.protocol === 'http:' || u.protocol === 'https:';
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Resolve the URL to open. Operator can override via env; default is the
+ * project's GitHub page so a demo on any machine has a sane target.
+ */
+function resolveDemoDocUrl(): string {
+  const fromEnv = process.env.CORTEX_DEMO_DOC_URL?.trim();
+  if (fromEnv && isSafeHttpUrl(fromEnv)) return fromEnv;
+  return 'https://github.com/Deepak-karani/cortex';
+}
+
+/**
+ * Cross-platform "open this URL in the default browser" with a short
+ * timeout so a stuck shell never blocks the orchestrator.
+ *   - darwin → `open <url>`
+ *   - linux  → `xdg-open <url>`
+ *   - other  → no-op, returns false
+ * URL is single-quoted to prevent shell expansion. We rely on isSafeHttpUrl
+ * to reject anything that could break out of the quotes.
+ */
+async function openUrlInBrowser(url: string): Promise<{ ok: boolean; reason: string }> {
+  if (!isSafeHttpUrl(url)) {
+    return { ok: false, reason: 'URL rejected by safety check (must be http or https).' };
+  }
+  const platform = process.platform;
+  let cmd: string | null = null;
+  if (platform === 'darwin') cmd = `open '${url}'`;
+  else if (platform === 'linux') cmd = `xdg-open '${url}'`;
+  if (!cmd) {
+    return { ok: false, reason: `No browser-open command for platform "${platform}".` };
+  }
+  try {
+    await execAsync(cmd, { timeout: 2000 });
+    return { ok: true, reason: `Opened ${url} in default browser.` };
+  } catch (err) {
+    return { ok: false, reason: `Open command failed: ${(err as Error).message}` };
+  }
+}
 
 export type ToolName =
   | 'recall_memory'
@@ -125,12 +194,29 @@ async function close_tabs(ctx: ToolContext): Promise<ToolResult> {
 }
 
 async function open_relevant_doc(ctx: ToolContext): Promise<ToolResult> {
+  const url = resolveDemoDocUrl();
+  // When CORTEX_REAL_TOOLS is enabled, we actually open the URL via the OS
+  // `open` command. Otherwise the tool stays in "logged intent" mode like
+  // the other action tools — same surface contract, no surprise side
+  // effect during a demo.
+  if (realToolsEnabled()) {
+    const r = await openUrlInBrowser(url);
+    return result(
+      'open_relevant_doc',
+      r.ok,
+      r.ok
+        ? `Opened "${url}" — most relevant doc for "${ctx.telemetry.currentTask}".`
+        : `Could not open browser: ${r.reason}`,
+      'Centers the screen on the artifact that completes the task.',
+      { doc: url, executed: r.ok, platform: process.platform },
+    );
+  }
   return result(
     'open_relevant_doc',
     true,
-    `Opened the most relevant doc for "${ctx.telemetry.currentTask}".`,
+    `Would open "${url}" for "${ctx.telemetry.currentTask}" (real execution off — set CORTEX_REAL_TOOLS=true).`,
     'Centers the screen on the artifact that completes the task.',
-    { doc: `cortex://docs/${encodeURIComponent(ctx.telemetry.currentTask)}` },
+    { doc: url, executed: false },
   );
 }
 

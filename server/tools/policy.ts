@@ -62,15 +62,18 @@ const RISK_CLASS: Record<ToolName, RiskClass> = {
   do_nothing: 'observe',
   ask_socratic: 'soft_action',
   // soft_action — touches the user's environment but doesn't modify state
-  // outside the cognitive OS (Focus profile, monitor brightness).
+  // outside the cognitive OS (Focus profile, monitor brightness). We also
+  // classify open_relevant_doc here: opening a doc is read-only and easy
+  // to undo (close the tab), so it's the least-risky of the actuating
+  // tools and should land in Yellow as well as Red.
   enable_focus_mode: 'soft_action',
   dim_secondary_monitor: 'soft_action',
+  open_relevant_doc: 'soft_action',
   // hard_action — observable side effects on third-party systems
-  // (Slack, browser tabs, calendar, file system). High blast radius if
-  // the agent is wrong.
+  // (Slack, browser tabs, calendar). High blast radius if the agent is
+  // wrong because they're hard to undo.
   mute_slack: 'hard_action',
   close_tabs: 'hard_action',
-  open_relevant_doc: 'hard_action',
   block_calendar_time: 'hard_action',
 };
 
