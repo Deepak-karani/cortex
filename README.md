@@ -165,7 +165,7 @@ cortex_2/
     ├── sim/                        # simulation engine + future projector
     ├── memory/                     # JSON-backed episodic memory
     └── data/memory.json            # auto-created
-```
+
 
 ## Demo script (90 s)
 
